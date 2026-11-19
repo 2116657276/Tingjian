@@ -1,0 +1,31 @@
+# macOS and editor metadata
+.DS_Store
+*.xcuserstate
+xcuserdata/
+
+# Swift builds and generated apps
+.build/
+.swiftpm/
+dist/
+
+# Local secrets and settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.p8
+
+# Recordings, transcripts and local test artifacts
+*.aiff
+*.aif
+*.caf
+*.m4a
+*.mp3
+*.wav
+*.jsonl
+*.log
+
+# Historical test evidence can contain local paths or screenshots
+docs/verification/**/evidence/
