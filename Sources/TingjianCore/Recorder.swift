@@ -1,3 +1,4 @@
+import Observation
 import AVFoundation
 import AppKit
 import Foundation
@@ -19,14 +20,28 @@ public enum TranscribeState: Equatable {
 
 /// 一次录音会话的调度:音频采集 → 落盘 → 分流识别 → 保存。
 @MainActor
+@Observable
+private final class RecordingMeter {
+    var duration: Double = 0
+    var level: Float = 0
+}
+
+@MainActor
 public final class Recorder: ObservableObject {
     public enum Phase { case idle, starting, recording, paused, finalizing, finished }
 
     @Published public private(set) var phase: Phase = .idle
     @Published public private(set) var segments: [Segment] = []
     @Published public private(set) var volatileText = ""
-    @Published public private(set) var duration: Double = 0
-    @Published public private(set) var level: Float = 0
+    private let meter = RecordingMeter()
+    public private(set) var duration: Double {
+        get { meter.duration }
+        set { meter.duration = newValue }
+    }
+    public private(set) var level: Float {
+        get { meter.level }
+        set { meter.level = newValue }
+    }
     @Published public private(set) var transcribe: TranscribeState = .idle
     @Published public private(set) var save: SaveState = .idle
     @Published public private(set) var message: String?
@@ -40,6 +55,10 @@ public final class Recorder: ObservableObject {
     @Published public private(set) var activeInputName: String?
     @Published public private(set) var isChangingInput = false
     public private(set) var courseName = ""
+    public private(set) var sessionDraftID: UUID?
+    private var sessionPlacement: RecordingPlacement?
+    /// 交付确认后在主线程同步通知工作区。
+    public var onDelivery: ((DeliveryResult, UUID?) -> Void)?
 
     public var saveRoot: URL
     public var localRoot: URL
@@ -77,8 +96,8 @@ public final class Recorder: ObservableObject {
     private var journalError: String?
     private var hadPersistenceFailure = false
     private var engineBoundary = 0.0
-    public var deliverFiles: @Sendable (String, URL?, URL, URL) throws -> DeliveryResult = {
-        try Deliverer.deliver(base: $0, audio: $1, markdown: $2, to: $3)
+    public var deliverFiles: @Sendable (String, URL?, URL, URL, UUID) throws -> DeliveryResult = {
+        try Deliverer.deliver(base: $0, audio: $1, markdown: $2, to: $3, id: $4)
     }
 
     public init(saveRoot: URL = Paths.defaultSaveRoot,
@@ -96,7 +115,7 @@ public final class Recorder: ObservableObject {
 
     // MARK: 开始 / 暂停 / 继续 / 结束
 
-    public func start(course: String) async {
+    public func start(course: String, draftID: UUID? = nil, destination: URL? = nil, placement: RecordingPlacement? = nil) async {
         guard phase == .idle || phase == .finished else { return }
         switch save {
         case .pending, .failed:
@@ -106,7 +125,9 @@ public final class Recorder: ObservableObject {
             break
         }
         resetForNewSession()
-        sessionSaveRoot = saveRoot
+        sessionPlacement = placement
+        sessionSaveRoot = placement?.directory ?? destination ?? saveRoot
+        sessionDraftID = draftID
         phase = .starting
         startupGeneration += 1
         let generation = startupGeneration
@@ -132,6 +153,9 @@ public final class Recorder: ObservableObject {
             }
             var info = SessionInfo(baseName: dir.lastPathComponent, course: course, startedAt: Date(), state: .recording)
             info.sampleRate = format.sampleRate
+            info.draftID = draftID
+            info.sessionDestination = sessionSaveRoot
+            info.recordingPlacement = placement
             let store = SessionStore(dir: dir, info: info)
             let pipeline = try AudioPipeline(url: store.audioURL, sampleRate: format.sampleRate)
             pendingPipeline = pipeline
@@ -373,14 +397,51 @@ public final class Recorder: ObservableObject {
     /// 从本地会话目录恢复并保存(进程异常退出或保存未完成)。
     public func recover(dir: URL) async {
         guard phase == .idle || phase == .finished else { return }
+        switch save {
+        case .pending, .failed:
+            guard localDir?.standardizedFileURL == dir.standardizedFileURL else {
+                message = "上次录音尚未保存，请先重试保存。"
+                return
+            }
+            await retrySave()
+            return
+        default:
+            break
+        }
         resetForNewSession()
-        sessionSaveRoot = saveRoot
         let original = SessionStore.readInfo(dir: dir)
+        sessionSaveRoot = original?.sessionDestination ?? original?.deliveryRoot ?? saveRoot
+        sessionDraftID = original?.draftID
+        sessionPlacement = original?.recordingPlacement
         let date = (try? dir.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
         var info = original ?? SessionInfo(baseName: dir.lastPathComponent, course: "", startedAt: date, state: .finalizing)
         phase = .finalizing; localDir = dir; courseName = info.course
         let store = SessionStore(dir: dir, info: info)
         self.store = store
+        if let id = info.deliveryID, let root = info.deliveryRoot {
+            do {
+                let placement = sessionPlacement
+                let existing = try await Task.detached {
+                    if let placement {
+                        return try Deliverer.placementPublication(placement, audioName: info.deliveryAudioName,
+                                                                  markdownName: info.baseName + ".md", id: id)
+                    }
+                    return try Deliverer.published(base: info.baseName, audioName: info.deliveryAudioName,
+                                            markdownName: info.baseName + ".md", in: root, id: id)
+                }.value
+                if let existing {
+                    duration = info.durationSeconds
+                    finalStatus = info.status
+                    transcribe = info.status == .completed ? .done : .incomplete
+                    acknowledgeDelivery(existing, store: store)
+                    phase = .finished
+                    return
+                }
+            } catch {
+                // Keep the attempted destination so retry checks the same publication.
+                sessionSaveRoot = root
+            }
+        }
         let loaded = SessionStore.loadEvents(dir: dir)
         assembler = TranscriptAssembler(events: loaded.events)
         notes = info.notes + loaded.issues
@@ -449,10 +510,46 @@ public final class Recorder: ObservableObject {
         phase = .finished
     }
 
-    public func retrySave() async {
+    public func retrySave(in newParent: URL? = nil) async {
         guard let store, phase == .finished else { return }
         switch save { case .pending, .failed: break; default: return }
         phase = .finalizing
+        if let newParent {
+            let oldInfo = store.info
+            let oldPlacement = sessionPlacement
+            if let id = oldInfo.deliveryID, let root = oldInfo.deliveryRoot {
+                do {
+                    let previous = try await Task.detached {
+                        if let oldPlacement {
+                            return try Deliverer.placementPublication(oldPlacement, audioName: oldInfo.deliveryAudioName,
+                                                                      markdownName: oldInfo.baseName + ".md", id: id)
+                        }
+                        return try Deliverer.published(base: oldInfo.baseName, audioName: oldInfo.deliveryAudioName,
+                                                       markdownName: oldInfo.baseName + ".md", in: root, id: id)
+                    }.value
+                    if let previous {
+                        acknowledgeDelivery(previous, store: store)
+                        phase = .finished
+                        return
+                    }
+                } catch {
+                    // A missing/replaced or incomplete target can be left behind after explicit reselection.
+                }
+            }
+            store.info.sessionDestination = newParent
+            store.info.recordingPlacement = nil
+            store.info.deliveryID = nil
+            store.info.deliveryRoot = nil
+            do { try store.save() }
+            catch {
+                store.info = oldInfo
+                save = .pending(store.dir.path, error.localizedDescription)
+                phase = .finished
+                return
+            }
+            sessionSaveRoot = newParent
+            sessionPlacement = nil
+        }
         if pendingFiles == nil {
             let audio = store.dir.appendingPathComponent(store.info.baseName + ".m4a")
             await finishSession(store: store, m4a: FileManager.default.fileExists(atPath: audio.path) ? audio : nil,
@@ -469,20 +566,36 @@ public final class Recorder: ObservableObject {
         save = .saving
         let destination = sessionDestination
         let operation = deliverFiles
+        let placement = sessionPlacement
         do {
+            let id = store.info.deliveryID ?? UUID()
+            store.info.deliveryID = id
+            store.info.deliveryRoot = destination
+            store.info.deliveryAudioName = f.m4a?.lastPathComponent
+            store.info.state = .pendingSave
+            try store.save()
             let result = try await Task.detached {
-                try operation(f.base, f.m4a, f.md, destination)
+                if let placement {
+                    return try Deliverer.fill(placement, audio: f.m4a, markdown: f.md, id: id)
+                }
+                return try operation(f.base, f.m4a, f.md, destination, id)
             }.value
-            deliveredFiles = result; deliveredDir = result.directory
-            store.info.destination = result.directory.path
-            store.info.state = .saved
-            persistMetadata()
-            save = .saved(result.directory.path)
+            acknowledgeDelivery(result, store: store)
         } catch {
             store.info.state = .pendingSave
             persistMetadata()
             save = .pending(store.dir.path, error.localizedDescription)
         }
+    }
+
+    private func acknowledgeDelivery(_ result: DeliveryResult, store: SessionStore) {
+        deliveredFiles = result
+        deliveredDir = result.directory
+        store.info.destination = result.directory.path
+        store.info.state = .saved
+        persistMetadata()
+        save = .saved(result.directory.path)
+        onDelivery?(result, sessionDraftID)
     }
 
     // MARK: 识别引擎
@@ -783,6 +896,8 @@ public final class Recorder: ObservableObject {
         engine = nil; engineLive = false; pendingFiles = nil
         metadataError = nil; journalError = nil; persistenceIssue = nil; hadPersistenceFailure = false; engineBoundary = 0; tickCount = 0
         sessionSaveRoot = nil
+        sessionDraftID = nil
+        sessionPlacement = nil
         activeInputUID = nil; activeInputName = nil; isChangingInput = false
         needsInputRebuild = false; interruptionRetried = false
         source = nil; pipeline = nil; store = nil

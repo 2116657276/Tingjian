@@ -168,31 +168,35 @@ func additionalRegressionChecks() async {
     await restore.recover(dir: quietDir)
     await check("正常无文字待保存会话恢复仍为完成", restore.finalStatus == .completed)
 
-    section("修复回归:纠正结构与交付路径")
-    for newline in ["\n", "\r", "\u{2028}", "\u{2029}"] {
-        do {
-            _ = try TextCorrector.buildCorrectedMarkdown(original: "[00:00:01] 原文", corrected: ["文字" + newline + "[00:00:30] 额外内容"], originalName: "x.md", model: "probe")
-            await check("拒绝换行或 Unicode 段落分隔符", false)
-        } catch { await check("拒绝换行或 Unicode 段落分隔符", true) }
+    if !skipCorrection {
+        section("修复回归:纠正结构与交付路径")
+        for newline in ["\n", "\r", "\u{2028}", "\u{2029}"] {
+            do {
+                _ = try TextCorrector.buildCorrectedMarkdown(original: "[00:00:01] 原文", corrected: ["文字" + newline + "[00:00:30] 额外内容"], originalName: "x.md", model: "probe")
+                await check("拒绝换行或 Unicode 段落分隔符", false)
+            } catch { await check("拒绝换行或 Unicode 段落分隔符", true) }
+        }
+        let goodMD = try! TextCorrector.buildCorrectedMarkdown(original: "[00:00:01] 原文", corrected: ["纠正。"], originalName: "x.md", model: "probe")
+        let derivative = try! Paths.writeUniqueMarkdown(goodMD, base: "x_校正版", in: dir)
+        let derivative2 = try! Paths.writeUniqueMarkdown(goodMD, base: "x_校正版", in: dir)
+        await check("校正版同名时另存不覆盖", derivative != derivative2)
+        let cleaned = try! TextCorrector.buildCorrectedMarkdown(
+            original: "# 课堂\n\n[00:00:01] 啊啊\n\n[00:00:02] 决策树的根节点。",
+            corrected: ["", "决策树的根节点。"], originalName: "课堂.md", model: "probe")
+        let cleanedSegments = MarkdownDoc.parseSegments(cleaned)
+        await check("纯语气词段保留空时间锚点",
+                    cleanedSegments.map(\.time) == ["00:00:01", "00:00:02"]
+                    && cleanedSegments.map(\.text) == ["", "决策树的根节点。"])
+
     }
-    let goodMD = try! TextCorrector.buildCorrectedMarkdown(original: "[00:00:01] 原文", corrected: ["纠正。"], originalName: "x.md", model: "probe")
-    let derivative = try! Paths.writeUniqueMarkdown(goodMD, base: "x_校正版", in: dir)
-    let derivative2 = try! Paths.writeUniqueMarkdown(goodMD, base: "x_校正版", in: dir)
-    await check("校正版同名时另存不覆盖", derivative != derivative2)
-    let cleaned = try! TextCorrector.buildCorrectedMarkdown(
-        original: "# 课堂\n\n[00:00:01] 啊啊\n\n[00:00:02] 决策树的根节点。",
-        corrected: ["", "决策树的根节点。"], originalName: "课堂.md", model: "probe")
-    let cleanedSegments = MarkdownDoc.parseSegments(cleaned)
-    await check("纯语气词段被省略且其余时间戳保留",
-                cleanedSegments.map(\.time) == ["00:00:02"] && cleanedSegments.first?.text == "决策树的根节点。")
 
     let slowSource = GateSource()
     let slow = Recorder(saveRoot: fresh("reg-slow-dest"), localRoot: fresh("reg-slow-local"), makeEngine: { MockEngine(.normal) }, makeSource: { _ in slowSource })
     let copies = TestCounter()
-    slow.deliverFiles = { base, audio, markdown, root in
+    slow.deliverFiles = { base, audio, markdown, root, id in
         copies.increment()
         Thread.sleep(forTimeInterval: 0.4)
-        return try Deliverer.deliver(base: base, audio: audio, markdown: markdown, to: root)
+        return try Deliverer.deliver(base: base, audio: audio, markdown: markdown, to: root, id: id)
     }
     await slow.start(course: "后台复制")
     _ = await waitUntil(2) { slow.transcribe == .running }
@@ -211,11 +215,11 @@ func additionalRegressionChecks() async {
                             makeEngine: { MockEngine(.normal) }, makeSource: { _ in retrySource })
     let retryCopies = TestCounter()
     let injected = TestCounter()
-    retryRec.deliverFiles = { base, audio, markdown, root in
+    retryRec.deliverFiles = { base, audio, markdown, root, id in
         if injected.count == 0 { injected.increment(); throw ExportError.copyVerify("注入的交付失败") }
         retryCopies.increment()
         Thread.sleep(forTimeInterval: 0.3)
-        return try Deliverer.deliver(base: base, audio: audio, markdown: markdown, to: root)
+        return try Deliverer.deliver(base: base, audio: audio, markdown: markdown, to: root, id: id)
     }
     await retryRec.start(course: "重复重试")
     _ = await waitUntil(2) { retryRec.transcribe == .running }
@@ -240,10 +244,13 @@ func saveRootSnapshotChecks() async {
     section("修复回归:保存目标快照")
     let dest1 = fresh("reg-snapshot-dest1"), dest2 = fresh("reg-snapshot-dest2")
     let source = GateSource()
+    let draftID = UUID()
     let r = Recorder(saveRoot: dest1, localRoot: fresh("reg-snapshot-local"),
                      makeEngine: { MockEngine(.normal) }, makeSource: { _ in source })
-    await r.start(course: "快照")
+    await r.start(course: "快照", draftID: draftID, destination: dest1)
     _ = await waitUntil(2) { r.transcribe == .running }
+    let info = r.localDir.flatMap { SessionStore.readInfo(dir: $0) }
+    await check("启动时持久化草稿和目标", info?.draftID == draftID && info?.sessionDestination == dest1)
     r.saveRoot = dest2
     source.push(frames: 24000)
     _ = await waitUntil(2) { r.duration >= 0.9 }
@@ -259,17 +266,25 @@ func saveRootSnapshotChecks() async {
     let blockedDest = fresh("reg-snapshot-blocked")
     let blocked = Recorder(saveRoot: blockedDest, localRoot: fresh("reg-snapshot-local2"),
                            makeEngine: { MockEngine(.normal) }, makeSource: { _ in failing })
-    blocked.deliverFiles = { _, _, _, _ in throw ExportError.copyVerify("注入的交付失败") }
+    blocked.deliverFiles = { _, _, _, _, _ in throw ExportError.copyVerify("注入的交付失败") }
     await blocked.start(course: "待保存")
     _ = await waitUntil(2) { blocked.transcribe == .running }
     _ = await waitUntil(2) { blocked.duration > 0.05 }
     await blocked.stop()
     if case .pending = blocked.save {} else { await check("注入交付失败进入待保存", false) }
+    if let unfinishedDir = blocked.localDir {
+        let restored = Recorder(saveRoot: dest2, localRoot: fresh("reg-snapshot-recover"),
+                                makeEngine: { MockEngine(.normal) }, makeSource: { _ in GateSource() })
+        await restored.recover(dir: unfinishedDir)
+        await check("恢复使用启动时记录的目标", restored.deliveredDir.map { ProjectLibrary.contains(blockedDest, $0) } == true)
+    } else {
+        await check("恢复使用启动时记录的目标", false)
+    }
     let beforeStarts = failing.starts
     await blocked.start(course: "不应开始")
     await check("待保存时禁止开始新录音", blocked.courseName == "待保存" && failing.starts == beforeStarts && blocked.phase == .finished)
-    blocked.deliverFiles = { base, audio, markdown, root in
-        try Deliverer.deliver(base: base, audio: audio, markdown: markdown, to: root)
+    blocked.deliverFiles = { base, audio, markdown, root, id in
+        try Deliverer.deliver(base: base, audio: audio, markdown: markdown, to: root, id: id)
     }
     await blocked.retrySave()
     await check("重试保存使用同一快照目标并成功", blocked.deliveredDir != nil
@@ -296,6 +311,33 @@ func libraryFixture(_ root: URL) throws -> (bundle: URL, audio: URL, doc: URL, c
 
 func libraryRegressionChecks() async {
     section("修复回归:资料库项目树与链接维护")
+    do {
+        let sampleRoot = fresh("prefix-rename")
+        let project = sampleRoot.appendingPathComponent("课程")
+        let child = project.appendingPathComponent("子目录")
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        try Data([1, 2]).write(to: project.appendingPathComponent("课程录音.caf"))
+        try "![[课程录音.caf]]".write(to: project.appendingPathComponent("课程文稿.md"), atomically: true, encoding: .utf8)
+        try "保留".write(to: child.appendingPathComponent("课程.md"), atomically: true, encoding: .utf8)
+        let result = try await ProjectLibrary(root: sampleRoot).rename(project, to: "新课", syncFilePrefixes: true)
+        let text = try String(contentsOf: result.appendingPathComponent("新课文稿.md"), encoding: .utf8)
+        await check("同步直属文件名前缀及文稿链接，保留子目录", text == "![[新课录音.caf]]" && FileManager.default.fileExists(atPath: result.appendingPathComponent("新课录音.caf").path) && FileManager.default.fileExists(atPath: result.appendingPathComponent("子目录/课程.md").path))
+    } catch { await check("同步直属文件名前缀及文稿链接，保留子目录", false, "\(error)") }
+    do {
+        let sampleRoot = fresh("prefix-conflict")
+        let project = sampleRoot.appendingPathComponent("课程")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let original = project.appendingPathComponent("课程文稿.md")
+        try "原稿".write(to: original, atomically: true, encoding: .utf8)
+        try "已有文件".write(to: project.appendingPathComponent("新课文稿.md"), atomically: true, encoding: .utf8)
+        do {
+            _ = try await ProjectLibrary(root: sampleRoot).rename(project, to: "新课", syncFilePrefixes: true)
+            await check("同步改名冲突时保留原项目", false)
+        } catch {
+            let text = try String(contentsOf: original, encoding: .utf8)
+            await check("同步改名冲突时保留原项目", text == "原稿" && !FileManager.default.fileExists(atPath: sampleRoot.appendingPathComponent("新课").path))
+        }
+    } catch { await check("同步改名冲突时保留原项目", false, "\(error)") }
     let root = fresh("library-root")
     let fixture: (bundle: URL, audio: URL, doc: URL, corrected: URL)
     do { fixture = try libraryFixture(root) } catch {
@@ -336,6 +378,19 @@ func libraryRegressionChecks() async {
                     && correctedText.contains("[[课堂记录.md]]") && !correctedText.contains("[[原稿.md]]")
                     && correctedText.contains("[00:00:01] 计算机网络的时延。"))
     } catch { await check("文稿改名后校正版来源链接同步且正文不变", false, "\(error)") }
+
+    do {
+        let file = root.appendingPathComponent("自引用.md")
+        try "[[自引用.md]]".write(to: file, atomically: true, encoding: .utf8)
+        let result = try await library.rename(file, to: "课件")
+        let updated = try String(contentsOf: result, encoding: .utf8)
+        await check("改名更新自引用且旧位置无副本",
+                    updated == "[[课件.md]]" && !FileManager.default.fileExists(atPath: file.path))
+        let unit = try await library.moveUnit(for: fixture.bundle.appendingPathComponent("新音频.caf"))
+        let independent = try await library.moveUnit(for: result)
+        await check("配对音频移动整份录音，独立文稿移动自身", unit.resolvingSymlinksInPath().path == fixture.bundle.resolvingSymlinksInPath().path && independent.resolvingSymlinksInPath().path == result.resolvingSymlinksInPath().path,
+                    "移动对象 \(unit.path)，独立文件 \(independent.path)")
+    } catch { await check("自引用改名与移动对象", false, error.localizedDescription) }
 
     do {
         _ = try await library.createProject(named: "项目丙", in: root)

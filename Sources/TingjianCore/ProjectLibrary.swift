@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// 资料库中的一项:磁盘上的真实文件或文件夹。
@@ -86,7 +87,7 @@ public actor ProjectLibrary {
         protectedURLs = urls.map { $0.standardizedFileURL }
     }
 
-    public func children(of directory: URL) throws -> [LibraryEntry] {
+    public func children(of directory: URL, classifyDirectories: Bool = true) throws -> [LibraryEntry] {
         let dir = directory.standardizedFileURL
         let fm = FileManager.default
         var isDir: ObjCBool = false
@@ -111,7 +112,7 @@ public actor ProjectLibrary {
             if values.isHidden == true || values.isSymbolicLink == true || values.isPackage == true { continue }
             if values.isDirectory == true {
                 entries.append(LibraryEntry(url: url, name: url.lastPathComponent, kind: .directory,
-                                            isRecordingBundle: Self.isRecordingBundle(url)))
+                                            isRecordingBundle: classifyDirectories && Self.isRecordingBundle(url)))
             } else if Self.isAudio(url) {
                 entries.append(LibraryEntry(url: url, name: url.lastPathComponent, kind: .audio, isRecordingBundle: false))
             } else if Self.isDocument(url) {
@@ -123,6 +124,52 @@ public actor ProjectLibrary {
             return a.name.localizedStandardCompare(b.name) == .orderedAscending
         }
         return entries
+    }
+
+    public func createRecordingPlacement(named title: String, in parent: URL) throws -> RecordingPlacement {
+        let parent = parent.standardizedFileURL
+        try requirePlacementParent(parent)
+        let fm = FileManager.default
+        if parent == root, !fm.fileExists(atPath: parent.path) {
+            try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+        }
+        let safe = Paths.sanitize(title).trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        let base = safe.isEmpty ? "未命名录音" : String(safe.prefix(60))
+        var index = 1
+        while true {
+            let name = index == 1 ? base : "\(base)_\(index)"
+            let folder = parent.appendingPathComponent(name, isDirectory: true)
+            if mkdir(folder.path, 0o755) == 0 {
+                do { return try RecordingPlacement(directory: folder) }
+                catch {
+                    if (try? fm.contentsOfDirectory(atPath: folder.path).isEmpty) == true {
+                        try? fm.trashItem(at: folder, resultingItemURL: nil)
+                    }
+                    throw error
+                }
+            }
+            let code = errno
+            guard code == EEXIST else { throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO) }
+            index += 1
+        }
+    }
+
+    public func moveRecordingPlacement(_ placement: RecordingPlacement, into parent: URL) throws -> RecordingPlacement {
+        try requirePlacementParent(parent)
+        try requirePlacementParent(placement.directory)
+        try placement.validateEmpty()
+        var moved = placement
+        moved.directory = try move(placement.directory, into: parent)
+        return moved
+    }
+
+    private func requirePlacementParent(_ parent: URL) throws {
+        try requireInside(parent)
+        guard Self.contains(root.resolvingSymlinksInPath(), parent.resolvingSymlinksInPath()) else {
+            throw LibraryError.outsideLibrary(parent.path)
+        }
+        try requireNotSymlink(parent)
+        try requireNotProtected(parent)
     }
 
     public func createProject(named name: String, in parent: URL) throws -> URL {
@@ -143,7 +190,7 @@ public actor ProjectLibrary {
         return destination
     }
 
-    public func rename(_ item: URL, to name: String) throws -> URL {
+    public func rename(_ item: URL, to name: String, syncFilePrefixes: Bool = false) throws -> URL {
         let src = item.standardizedFileURL
         try requireInside(src)
         guard src != root else { throw LibraryError.rootNotMutable }
@@ -158,61 +205,134 @@ public actor ProjectLibrary {
             throw LibraryError.nameConflict(newName)
         }
 
-        // 预读需要改写链接的文稿,并确认可写;失败时不改动任何文件。
-        var edits: [(url: URL, original: Data, updated: Data)] = []
-        if kind != .directory {
-            let oldName = src.lastPathComponent
-            let directory = src.deletingLastPathComponent()
-            let candidates: [URL]
-            do {
-                candidates = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles])
-                    .filter { ProjectLibrary.isDocument($0) }
-            } catch {
-                throw LibraryError.operationFailed("无法读取 \(directory.path):\(error.localizedDescription)")
-            }
-            for md in candidates {
-                let original: Data
-                do { original = try Data(contentsOf: md) }
-                catch { throw LibraryError.operationFailed("无法读取 \(md.path):\(error.localizedDescription)") }
-                guard let text = String(data: original, encoding: .utf8) else {
-                    throw LibraryError.operationFailed("\(md.path) 不是 UTF-8 文稿,未改动任何文件")
-                }
-                let oldLink = "[[\(oldName)]]"
-                guard text.contains(oldLink) else { continue }
-                guard FileManager.default.isWritableFile(atPath: md.path) else {
-                    throw LibraryError.notWritable(md.path)
-                }
-                let updated = text.replacingOccurrences(of: oldLink, with: "[[\(newName)]]")
-                edits.append((md, original, Data(updated.utf8)))
-            }
-        }
-
-        do {
+        let parent = src.deletingLastPathComponent()
+        let scan = kind == .directory ? src : parent
+        if kind == .directory && !syncFilePrefixes {
             try FileManager.default.moveItem(at: src, to: destination)
-        } catch {
-            throw LibraryError.operationFailed("无法改名 \(src.lastPathComponent):\(error.localizedDescription)")
+            return destination
+        }
+        let fm = FileManager.default
+        let children = try fm.contentsOfDirectory(at: scan, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        var names: [String: String] = [:]
+        if kind == .directory {
+            for child in children {
+                let values = try child.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                let old = child.lastPathComponent
+                guard values.isRegularFile == true, values.isSymbolicLink != true, old.hasPrefix(src.lastPathComponent) else { continue }
+                let renamed = newName + old.dropFirst(src.lastPathComponent.count)
+                guard !fm.fileExists(atPath: scan.appendingPathComponent(renamed).path) else {
+                    throw LibraryError.nameConflict(renamed)
+                }
+                names[old] = renamed
+            }
+        } else {
+            names[src.lastPathComponent] = newName
         }
 
-        var written: [URL] = []
+        let links = Dictionary(uniqueKeysWithValues: names.map { ("[[" + $0.key + "]]", "[[" + $0.value + "]]") })
+        let linkPattern = try NSRegularExpression(pattern: #"\[\[[^\]\n]+\]\]"#)
+        let writeRoot = kind == .directory ? destination : parent
+        var edits: [(target: URL, original: Data, updated: Data)] = []
+        for child in children where Self.isDocument(child) && !child.lastPathComponent.hasPrefix(".") {
+            let values = try child.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            let original = try Data(contentsOf: child)
+            guard let text = String(data: original, encoding: .utf8) else {
+                throw LibraryError.operationFailed("文稿编码无法读取，改名已取消：" + child.lastPathComponent)
+            }
+            var updated = text
+            for match in linkPattern.matches(in: text, range: NSRange(text.startIndex..., in: text)).reversed() {
+                guard let range = Range(match.range, in: text), let replacement = links[String(text[range])] else { continue }
+                // Resolve against the current string. Matches are replaced from the end.
+                if let currentRange = Range(match.range, in: updated) { updated.replaceSubrange(currentRange, with: replacement) }
+            }
+            guard updated != text else { continue }
+            try requireNotProtected(child)
+            guard fm.isWritableFile(atPath: child.path) else { throw LibraryError.notWritable(child.path) }
+            edits.append((writeRoot.appendingPathComponent(names[child.lastPathComponent] ?? child.lastPathComponent),
+                          original, Data(updated.utf8)))
+        }
+
+        var moved: [(from: URL, to: URL)] = []
+        var written = 0
         do {
+            try fm.moveItem(at: src, to: destination)
+            moved.append((src, destination))
+            if kind == .directory {
+                for (before, after) in names.sorted(by: { $0.key < $1.key }) {
+                    let from = destination.appendingPathComponent(before)
+                    let to = destination.appendingPathComponent(after)
+                    try fm.moveItem(at: from, to: to)
+                    moved.append((from, to))
+                }
+            }
             for edit in edits {
-                try edit.updated.write(to: edit.url, options: [.atomic])
-                written.append(edit.url)
+                try replaceContents(at: edit.target, expected: edit.original, with: edit.updated)
+                written += 1
             }
         } catch {
-            var problems: [String] = []
-            for edit in edits where written.contains(edit.url) {
-                do { try edit.original.write(to: edit.url, options: [.atomic]) }
-                catch { problems.append("\(edit.url.path):\(error.localizedDescription)") }
+            var failures: [String] = []
+            for edit in edits.prefix(written).reversed() {
+                do { try replaceContents(at: edit.target, expected: edit.updated, with: edit.original) }
+                catch { failures.append(edit.target.path + " " + error.localizedDescription) }
             }
-            do { try FileManager.default.moveItem(at: destination, to: src) }
-            catch { problems.append("\(destination.path) → \(src.path):\(error.localizedDescription)") }
-            if problems.isEmpty {
-                throw LibraryError.operationFailed("改名失败,已恢复原状:\(error.localizedDescription)")
+            for step in moved.reversed() {
+                do { try fm.moveItem(at: step.to, to: step.from) }
+                catch { failures.append(step.to.path + " " + error.localizedDescription) }
             }
-            throw LibraryError.rollbackFailed("改名失败且未能完全恢复,请检查这些路径:\n" + problems.joined(separator: "\n"))
+            if !failures.isEmpty { throw LibraryError.rollbackFailed(failures.joined(separator: "\n")) }
+            throw error
         }
         return destination
+    }
+
+    private func replaceContents(at url: URL, expected: Data, with updated: Data) throws {
+        var coordinationError: NSError?
+        var writeError: Error?
+        NSFileCoordinator().coordinate(writingItemAt: url, options: .forReplacing, error: &coordinationError) { coordinated in
+            do {
+                guard try Data(contentsOf: coordinated) == expected else {
+                    throw LibraryError.operationFailed("文稿已被外部修改，请刷新后重试：" + coordinated.lastPathComponent)
+                }
+                try updated.write(to: coordinated, options: .atomic)
+            } catch { writeError = error }
+        }
+        if let coordinationError { throw coordinationError }
+        if let writeError { throw writeError }
+    }
+
+    public func moveUnit(for item: URL) throws -> URL {
+        let url = item.standardizedFileURL
+        try requireInside(url)
+        guard try kindOf(url) != .directory else { return url }
+        let parent = url.deletingLastPathComponent()
+        guard parent.resolvingSymlinksInPath().path != root.resolvingSymlinksInPath().path else { return url }
+        let entries = try children(of: parent, classifyDirectories: false)
+        let audioNames = Set(entries.filter { $0.kind == .audio }.map(\.name))
+        for entry in entries where entry.kind == .document && (Self.isAudio(url) || entry.url.path == url.path) {
+            let text = try String(contentsOf: entry.url, encoding: .utf8)
+            if let audio = Self.linkedAudio(in: text, beside: entry.url, available: audioNames),
+               Self.isDocument(url) || audio.lastPathComponent == url.lastPathComponent {
+                return parent
+            }
+        }
+        return url
+    }
+
+    public nonisolated static func linkedAudio(in text: String, beside document: URL, available: Set<String>? = nil) -> URL? {
+        guard let expression = try? NSRegularExpression(pattern: #"!\[\[([^\]\n]+)\]\]"#) else { return nil }
+        for match in expression.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+            guard let range = Range(match.range(at: 1), in: text) else { continue }
+            let name = text[range].trimmingCharacters(in: .whitespaces)
+            let url = document.deletingLastPathComponent().appendingPathComponent(name)
+            guard isAudio(url) else { continue }
+            if let available {
+                if available.contains(name) { return url }
+            } else if FileManager.default.fileExists(atPath: url.path) {
+                return url
+            }
+        }
+        return nil
     }
 
     public func move(_ item: URL, into directory: URL) throws -> URL {

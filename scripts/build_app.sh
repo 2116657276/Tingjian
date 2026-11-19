@@ -5,23 +5,22 @@ cd "$(dirname "$0")/.."
 . scripts/env.sh
 FINAL="${1:-$(pwd)/dist/听笺.app}"
 mkdir -p "$(dirname "$FINAL")"
-OUT=/tmp/tingjian-stage/听笺.app   # 在 /tmp 组装并签名,避免云盘目录给包加扩展属性
-BUILD=/tmp/tingjian-build-release
+STAGE="$(mktemp -d /private/tmp/tingjian-build.XXXXXX)"
+trap 'trash "$STAGE"' EXIT
+OUT="$STAGE/听笺.app"
+BUILD="${TINGJIAN_BUILD_ROOT:-/tmp/tingjian-build-release}"
 
 swift build -c release -Xswiftc -gnone --disable-sandbox --scratch-path "$BUILD" --product Tingjian
 BIN="$BUILD/release/Tingjian"
 
-if [ -e /tmp/tingjian-stage ]; then trash /tmp/tingjian-stage; fi
-mkdir -p /tmp/tingjian-stage
 mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 cp "$BIN" "$OUT/Contents/MacOS/Tingjian"
 
 # 图标:用 Swift 脚本绘制 PNG,再转 icns
-ICONSET=/tmp/tingjian-icon.iconset
-if [ -e "$ICONSET" ]; then trash "$ICONSET"; fi
+ICONSET="$STAGE/AppIcon.iconset"
 mkdir -p "$ICONSET"
-swiftc -module-cache-path "$CLANG_MODULE_CACHE_PATH" -o /tmp/tingjian-icongen scripts/icon.swift
-/tmp/tingjian-icongen "$ICONSET"
+swiftc -module-cache-path "$CLANG_MODULE_CACHE_PATH" -o "$STAGE/tingjian-icongen" scripts/icon.swift
+"$STAGE/tingjian-icongen" "$ICONSET"
 iconutil -c icns "$ICONSET" -o "$OUT/Contents/Resources/AppIcon.icns"
 
 cat > "$OUT/Contents/Info.plist" <<PLIST
@@ -35,7 +34,13 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
  <key>CFBundleIconFile</key><string>AppIcon</string>
  <key>CFBundlePackageType</key><string>APPL</string>
  <key>CFBundleShortVersionString</key><string>1.0.1</string>
- <key>CFBundleVersion</key><string>2</string>
+ <key>CFBundleVersion</key><string>17</string>
+ <key>UTExportedTypeDeclarations</key>
+ <array><dict>
+  <key>UTTypeIdentifier</key><string>com.local.tingjian.workspace-item</string>
+  <key>UTTypeDescription</key><string>听笺工作区项目</string>
+  <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+ </dict></array>
  <key>LSMinimumSystemVersion</key><string>26.0</string>
  <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
  <key>NSHighResolutionCapable</key><true/>
@@ -43,7 +48,7 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 
-cat > /tmp/tingjian.entitlements <<ENT
+cat > "$STAGE/tingjian.entitlements" <<ENT
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>
@@ -53,12 +58,11 @@ ENT
 xattr -cr "$OUT"
 codesign --force --sign - --identifier com.local.tingjian \
   --requirements '=designated => identifier "com.local.tingjian"' \
-  --entitlements /tmp/tingjian.entitlements "$OUT"
+  --entitlements "$STAGE/tingjian.entitlements" "$OUT"
 codesign --verify --strict --verbose=1 "$OUT"
 
 # 复制到交付目录(不带扩展属性),再校验一次
 if [ -e "$FINAL" ]; then trash "$FINAL"; fi
 ditto --norsrc --noextattr --noqtn "$OUT" "$FINAL"
 codesign --verify --strict --verbose=1 "$FINAL"
-if [ "$OUT" != "$FINAL" ]; then trash "$OUT"; fi
 echo "已生成:$FINAL"

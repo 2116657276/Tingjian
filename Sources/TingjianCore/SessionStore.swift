@@ -9,6 +9,13 @@ public struct SessionInfo: Codable, Equatable, Sendable {
     public var sampleRate: Double = 0
     public var savedSamples: Int64 = 0
     public var destination: String?
+    /// 录音所属草稿及开始时固定的目标。旧会话可能没有这些字段。
+    public var draftID: UUID?
+    public var sessionDestination: URL?
+    public var recordingPlacement: RecordingPlacement?
+    var deliveryID: UUID?
+    var deliveryRoot: URL?
+    var deliveryAudioName: String?
     public var status: TranscriptStatus?
     public var notes: [String] = []
     public var durationSeconds: Double { sampleRate > 0 ? Double(savedSamples) / sampleRate : 0 }

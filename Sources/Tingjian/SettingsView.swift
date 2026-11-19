@@ -114,7 +114,7 @@ struct SettingsView: View {
                         }
                     }
 
-                    SettingsSection(title: "文字纠正", detail: "结合全文主题和相邻段落修正术语，清理无意义语气词与重复；原稿始终保留。") {
+                    SettingsSection(title: "文字纠正", detail: "修正转写中的错字和术语，删去多余的语气词。原稿会保留。") {
                         SettingsFieldRow(title: "启用", systemImage: "text.badge.checkmark") {
                             Toggle("启用文字纠正", isOn: $model.llmEnabled)
                                 .labelsHidden()
@@ -123,11 +123,46 @@ struct SettingsView: View {
 
                         SettingsDivider()
 
-                        SettingsFieldRow(title: "网关地址", systemImage: "network") {
-                            TextField("http://127.0.0.1:3425/v1", text: $model.llmURL)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.system(size: 12, design: .monospaced))
-                                .accessibilityLabel("网关地址")
+                        SettingsFieldRow(title: "纠正方式", systemImage: "text.alignleft") {
+                            VStack(alignment: .trailing, spacing: 4) {
+                                Picker("纠正方式", selection: $model.correctionStyle) {
+                                    ForEach(CorrectionStyle.allCases) { style in
+                                        Text(style.title).tag(style)
+                                    }
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.menu)
+                                .accessibilityLabel("纠正方式")
+                                Text(model.correctionStyle.detail).settingsFootnote()
+                            }
+                        }
+
+                        SettingsDivider()
+
+                        SettingsFieldRow(title: "网关", systemImage: "network") {
+                            Picker("网关", selection: $model.gatewayChoice) {
+                                ForEach(GatewayChoice.allCases) { choice in
+                                    Text(choice.title).tag(choice)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .accessibilityLabel("网关")
+                        }
+
+                        SettingsDivider()
+
+                        SettingsFieldRow(title: "网关地址", systemImage: "link") {
+                            if model.gatewayChoice == .custom {
+                                TextField("https://example.com/v1", text: $model.customGatewayAddress)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .accessibilityLabel("网关地址")
+                            } else {
+                                Text(model.llmURL)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .textSelection(.enabled)
+                            }
                         }
 
                         SettingsDivider()
@@ -153,11 +188,11 @@ struct SettingsView: View {
                                 if isRefreshingModels {
                                     ProgressView().controlSize(.small)
                                 } else {
-                                    Label("刷新", systemImage: "arrow.clockwise")
+                                    Label("刷新模型", systemImage: "arrow.clockwise")
                                 }
                             }
                             .controlSize(.small)
-                            .disabled(isRefreshingModels)
+                            .disabled(isRefreshingModels || model.gatewayEndpoint == nil)
                             .accessibilityLabel("刷新模型清单")
                         }
                         .padding(.horizontal, 14)
@@ -166,13 +201,22 @@ struct SettingsView: View {
                         SettingsDivider()
 
                         SettingsFieldRow(title: "API Key", systemImage: "key") {
-                            SecureField("需要时填写,本机 Magpie 通常留空", text: $model.apiKey)
-                                .textFieldStyle(.roundedBorder)
-                                .onSubmit { model.saveAPIKey() }
-                                .accessibilityLabel("API Key")
+                            VStack(alignment: .trailing, spacing: 4) {
+                                HStack {
+                                    SecureField(apiKeyPlaceholder, text: $model.apiKey)
+                                        .textFieldStyle(.roundedBorder)
+                                        .onSubmit { model.saveAPIKey() }
+                                        .accessibilityLabel("API Key")
+                                    Button("保存密钥") { model.saveAPIKey() }
+                                }
+                                if let status = model.apiKeyStatus {
+                                    Text(status).settingsFootnote()
+                                }
+                            }
+                            .disabled(model.gatewayEndpoint == nil)
                         }
 
-                        Text("默认 Magpie:\(AppModel.magpieURL),模型 \(AppModel.defaultModel),推理强度 high。仅在点击“纠正文本”时发送文稿文字，不发送录音。重试会复用已验证的本地结果；网关提供 token 用量时会显示实际数据。")
+                        Text("每个网关地址单独保存密钥。要移除密钥，请清空后点「保存密钥」。点击「纠正文本」后，转写文字会发给当前网关。")
                             .settingsFootnote()
                             .padding(.horizontal, 14)
                             .padding(.bottom, 12)
@@ -187,10 +231,16 @@ struct SettingsView: View {
         .tint(TingjianTheme.accent)
         .frame(width: 700)
         .frame(minHeight: 660)
-        .onDisappear { model.saveAPIKey() }
         .task {
             model.refreshInputDevices()
-            await model.refreshModels()
+        }
+    }
+
+    private var apiKeyPlaceholder: String {
+        switch model.gatewayChoice {
+        case .deepSeek: "填写 DeepSeek API Key"
+        case .magpie: "本机 Magpie 通常留空"
+        case .custom: "按服务要求填写，可留空"
         }
     }
 
@@ -229,12 +279,16 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var modelControl: some View {
-        if model.gatewayModels.isEmpty {
-            TextField("模型名称", text: $model.llmModel)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 12, design: .monospaced))
-                .accessibilityLabel("模型名称")
-                .accessibilityHint("网关不可用时可手动填写模型 ID")
+        if model.gatewayModels.isEmpty || model.selectedModel == nil {
+            VStack(alignment: .trailing, spacing: 3) {
+                if !model.gatewayModels.isEmpty {
+                    ModelMenu().environmentObject(model)
+                }
+                TextField("模型 ID", text: $model.llmModel)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                    .accessibilityLabel("模型 ID")
+            }
         } else {
             VStack(alignment: .trailing, spacing: 3) {
                 ModelMenu()
@@ -252,12 +306,13 @@ struct SettingsView: View {
     @ViewBuilder
     private var effortControl: some View {
         if model.effortOptions.isEmpty {
-            TextField("high", text: $model.llmEffort)
+            TextField("留空使用服务默认强度", text: $model.llmEffort)
                 .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: 180)
                 .accessibilityLabel("推理强度")
         } else {
             Picker("推理强度", selection: $model.llmEffort) {
+                Text("自动（\(model.defaultEffort)）").tag("")
                 ForEach(model.effortOptions, id: \.self) { level in
                     Text(level).tag(level)
                 }
@@ -273,17 +328,17 @@ struct SettingsView: View {
     private var gatewayStatus: some View {
         switch model.gatewayState {
         case .idle:
-            StatusLine(text: "尚未读取模型清单", systemImage: "circle.dotted", color: TingjianTheme.tertiaryInk)
+            StatusLine(text: "未刷新模型", systemImage: "circle.dotted", color: TingjianTheme.tertiaryInk)
         case .loading:
-            StatusLine(text: "正在读取网关模型…", systemImage: "arrow.trianglehead.2.clockwise.rotate.90", color: TingjianTheme.accent)
+            StatusLine(text: "正在刷新…", systemImage: "arrow.trianglehead.2.clockwise.rotate.90", color: TingjianTheme.accent)
         case .loaded(let count):
             StatusLine(
-                text: count == 0 ? "网关没有返回模型,可手动填写模型名和强度" : "已读取 \(count) 个模型",
+                text: count == 0 ? "没有找到模型，可手动填写模型 ID" : "\(count) 个模型",
                 systemImage: count == 0 ? "exclamationmark.triangle" : "checkmark.circle",
                 color: count == 0 ? TingjianTheme.warning : TingjianTheme.accent)
         case .failed(let message):
             let detail = message.trimmingCharacters(in: CharacterSet(charactersIn: "。.！!"))
-            StatusLine(text: "连接失败:\(detail)。仍可手动填写模型名和强度。",
+            StatusLine(text: "无法获取模型。\(detail)。你也可以手动填写模型 ID。",
                        systemImage: "exclamationmark.triangle.fill", color: TingjianTheme.warning)
         }
     }
@@ -370,7 +425,6 @@ private struct ModelMenu: View {
             ForEach(model.gatewayModels) { candidate in
                 Button {
                     model.llmModel = candidate.id
-                    model.normalizeEffort()
                 } label: {
                     Text((model.llmModel == candidate.id ? "✓ " : "")
                          + (candidate.supportsChat ? candidate.displayName : "\(candidate.displayName)(不支持纠正)"))
@@ -379,7 +433,7 @@ private struct ModelMenu: View {
                 .help(candidate.id)
             }
         } label: {
-            Text(model.selectedModel?.displayName ?? model.llmModel)
+            Text(model.selectedModel?.displayName ?? (model.llmModel.isEmpty ? "选择模型" : model.llmModel))
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(TingjianTheme.ink)
                 .lineLimit(1)
@@ -389,7 +443,7 @@ private struct ModelMenu: View {
         .menuStyle(.borderlessButton)
         .frame(maxWidth: 340, alignment: .trailing)
         .accessibilityLabel("模型")
-        .accessibilityValue(model.selectedModel?.displayName ?? model.llmModel)
+        .accessibilityValue(model.selectedModel?.displayName ?? (model.llmModel.isEmpty ? "选择模型" : model.llmModel))
         .help(model.selectedModel?.id ?? model.llmModel)
     }
 }

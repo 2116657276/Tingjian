@@ -1,3 +1,4 @@
+import Observation
 import AVFoundation
 import Foundation
 import TingjianCore
@@ -16,11 +17,23 @@ enum PlaybackError: Error, LocalizedError {
     }
 }
 
+@MainActor
+@Observable
+private final class PlaybackProgress {
+    var position: Double = 0
+    var preview: Double?
+    var isScrubbing = false
+}
+
 /// 应用内唯一播放器:切换资源时移除旧观察者,结束时归为暂停。
 @MainActor
 final class PlaybackModel: ObservableObject {
     @Published private(set) var currentURL: URL?
-    @Published private(set) var position: Double = 0
+    private let progress = PlaybackProgress()
+    private(set) var position: Double {
+        get { progress.position }
+        set { progress.position = newValue }
+    }
     @Published private(set) var duration: Double = 0
     @Published private(set) var isPlaying = false
     @Published private(set) var error: String?
@@ -75,6 +88,7 @@ final class PlaybackModel: ObservableObject {
             position = 0
             isPlaying = false
             for _ in 0..<60 {
+                try Task.checkCancellation()
                 if generation != loadGeneration { return }
                 if item.status == .readyToPlay { return }
                 if item.status == .failed {
@@ -108,6 +122,21 @@ final class PlaybackModel: ObservableObject {
         isPlaying ? pause() : play()
     }
 
+    var displayedPosition: Double { progress.preview ?? position }
+
+    func previewSeek(_ seconds: Double) {
+        if progress.isScrubbing { progress.preview = seconds }
+        else { seek(to: seconds) }
+    }
+
+    func setScrubbing(_ editing: Bool) {
+        progress.isScrubbing = editing
+        if !editing, let target = progress.preview {
+            progress.preview = nil
+            seek(to: target)
+        }
+    }
+
     func seek(to seconds: Double) {
         guard currentURL != nil, canSeek else { return }
         let target = min(max(0, seconds), max(0, duration - 0.02))
@@ -124,6 +153,8 @@ final class PlaybackModel: ObservableObject {
     }
 
     private func teardown() {
+        progress.isScrubbing = false
+        progress.preview = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
         currentURL = nil
@@ -136,7 +167,8 @@ final class PlaybackModel: ObservableObject {
         guard player.currentItem != nil else { return }
         let seconds = time.seconds
         if seconds.isFinite { position = max(0, min(seconds, max(duration, seconds))) }
-        isPlaying = player.rate > 0
+        let playing = player.rate > 0
+        if isPlaying != playing { isPlaying = playing }
         if player.currentItem?.status == .failed {
             error = player.currentItem?.error?.localizedDescription ?? "播放中断"
             isPlaying = false

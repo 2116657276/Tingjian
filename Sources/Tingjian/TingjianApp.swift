@@ -27,7 +27,7 @@ struct TingjianApp: App {
                     .disabled(AppModel.shared.recorder.isActive)
                 Button("关闭标签页") { AppModel.shared.closeActiveTab() }
                     .keyboardShortcut("w", modifiers: .command)
-                    .disabled(AppModel.shared.selection.url == nil)
+                    .disabled(!AppModel.shared.canCloseActiveTab)
             }
             CommandMenu("标签页") {
                 Button("上一个标签页") { AppModel.shared.activateRelativeTab(-1) }
@@ -36,17 +36,18 @@ struct TingjianApp: App {
                     .keyboardShortcut("]", modifiers: [.command, .option])
                 Divider()
                 Button("关闭当前标签页") { AppModel.shared.closeActiveTab() }
-                    .disabled(AppModel.shared.selection.url == nil)
+                    .disabled(!AppModel.shared.canCloseActiveTab)
             }
             CommandMenu("资料库") {
-                Button("回到当前录音") { AppModel.shared.select(.currentRecording) }
+                Button("回到当前录音") { AppModel.shared.showCurrentRecording() }
+                    .disabled(!AppModel.shared.hasCurrentRecording)
                 Divider()
                 Button("重命名所选项…") { AppModel.shared.requestRenameSelection() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                     .disabled(AppModel.shared.selection.url == nil)
                 Button("移动所选项…") {
                     if let url = AppModel.shared.selection.url {
-                        AppModel.shared.chooseMoveDestination(for: url)
+                        AppModel.shared.requestMove(url)
                     }
                 }
                 .disabled(AppModel.shared.selection.url == nil)
@@ -86,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag { restoreMainWindow() }

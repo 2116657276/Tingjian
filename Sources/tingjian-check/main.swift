@@ -4,6 +4,7 @@ import TingjianCore
 
 // 验证工具:合成音频 + 故障注入 + 真实识别。不打开麦克风。
 
+let skipCorrection = CommandLine.arguments.contains("--skip-correction")
 var failures = 0
 func check(_ name: String, _ cond: @autoclosure () async -> Bool, _ detail: String = "") async {
     if await cond() { print("  ✓ \(name)") } else { failures += 1; print("  ✗ \(name) \(detail)") }
@@ -42,6 +43,27 @@ if CommandLine.arguments.contains("--trash-smoke") {
         fputs("TRASH_SMOKE_FAILED: \(error.localizedDescription)\n", stderr)
         exit(1)
     }
+}
+
+if CommandLine.arguments.contains("--recording-target-only") {
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    await saveRootSnapshotChecks()
+    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
+    exit(failures == 0 ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--placement-only") {
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    await recordingPlacementChecks()
+    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
+    exit(failures == 0 ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--correction-only") {
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    await continuousCorrectionChecks()
+    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
+    exit(failures == 0 ? 0 : 1)
 }
 
 /// 生成 24k 单声道测试音(非语音),用于不依赖识别的链路测试。
@@ -198,10 +220,27 @@ do {
     let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: r1.directory.path).filter { $0.hasSuffix(".partial") }) ?? ["?"]
     await check("无遗留临时文件", leftovers.isEmpty)
     await check("课程名清理非法字符", Paths.sanitize("a/b:c") == "a-b-c" && Paths.baseName(date: Date(), course: "").count == 19)
+    let transactionalRoot = fresh("delivery-transaction")
+    let id = UUID()
+    let missing = src.appendingPathComponent("missing.md")
+    do {
+        _ = try Deliverer.deliver(base: "lesson", audio: au, markdown: missing, to: transactionalRoot, id: id)
+        await check("文稿复制失败被报告", false)
+    } catch {
+        let visible = try! FileManager.default.contentsOfDirectory(at: transactionalRoot, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)
+        await check("文稿复制失败无半份可见录音", visible.isEmpty)
+    }
+    let first = try! Deliverer.deliver(base: "lesson", audio: au, markdown: m, to: transactionalRoot, id: id)
+    let retry = try! Deliverer.deliver(base: "lesson", audio: au, markdown: m, to: transactionalRoot, id: id)
+    let published = try! FileManager.default.contentsOfDirectory(at: transactionalRoot, includingPropertiesForKeys: nil,
+                                                                 options: .skipsHiddenFiles)
+    await check("发布后重复同一交付只返回原目录",
+                first.directory.resolvingSymlinksInPath() == retry.directory.resolvingSymlinksInPath()
+                && published.count == 1)
+
 }
 
 // MARK: 3 LLM
-section("LLM 纠正(模拟服务)")
 final class MockURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var handler: ((URLRequest, Data) -> (Int, Data))?
     nonisolated(unsafe) static var requests = 0
@@ -221,6 +260,8 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
     }
     override func stopLoading() {}
 }
+if !skipCorrection {
+section("LLM 纠正(模拟服务)")
 do {
     let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [MockURLProtocol.self]
     let sess = URLSession(configuration: cfg)
@@ -485,7 +526,7 @@ do {
     let ms = (try? await GatewayModel.fetch(baseURL: "http://x/v1", session: sess)) ?? []
     await check("解析模型清单", ms.count == 3 && ms[0].displayName == "A")
     await check("仅 responses 的模型标记为不支持纠正", ms[0].supportsChat && !ms[1].supportsChat && ms[2].supportsChat)
-    await check("默认强度:有 high 取 high,否则取最后一项", ms[0].defaultLevel == "high" && ms[1].defaultLevel == "medium")
+    await check("默认强度取最低档", ms[0].defaultLevel == "low" && ms[1].defaultLevel == "low")
     MockURLProtocol.handler = { _, body in
         let captured = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
         let msgs = captured["messages"] as! [[String: String]]
@@ -498,6 +539,8 @@ do {
     let c = LLMConfig(baseURL: "http://127.0.0.1:3425/v1", model: "m", apiKey: "", reasoningEffort: "high", course: "计算机网络")
     let r = try? await TextCorrector(config: c, session: sess).correct([(time: "00:00:01", text: "你好")])
     await check("忽略 reasoning_content", r == ["你好"])
+}
+
 }
 
 // MARK: 4 录音链路(模拟引擎 + 合成音)
@@ -587,9 +630,9 @@ section("交付失败与重试")
 do {
     let (r, local, dest) = await MainActor.run { makeRecorder("badsave", tone: tone, engines: [{ MockEngine(.normal) }]) }
     let injected = TestCounter()
-    r.deliverFiles = { base, audio, markdown, root in
+    r.deliverFiles = { base, audio, markdown, root, id in
         if injected.count == 0 { injected.increment(); throw ExportError.copyVerify("注入的交付失败") }
-        return try Deliverer.deliver(base: base, audio: audio, markdown: markdown, to: root)
+        return try Deliverer.deliver(base: base, audio: audio, markdown: markdown, to: root, id: id)
     }
     await r.start(course: "")
     _ = await waitUntil(3) { r.duration > 2 }
@@ -693,7 +736,7 @@ if CommandLine.arguments.contains("--real") {
     }
 }
 
-if CommandLine.arguments.contains("--magpie") {
+if !skipCorrection, CommandLine.arguments.contains("--magpie") {
     section("真实 Magpie 网关(合成文字,非录音)")
     let url = "http://127.0.0.1:3425/v1"
     let models = (try? await GatewayModel.fetch(baseURL: url)) ?? []

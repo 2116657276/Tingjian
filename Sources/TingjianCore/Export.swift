@@ -1,3 +1,4 @@
+import Darwin
 import AVFoundation
 import Foundation
 
@@ -91,12 +92,14 @@ public struct MarkdownDoc {
     public static func parseSegments(_ md: String) -> [(time: String, text: String)] {
         md.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
             let l = String(line)
-            guard l.hasPrefix("["), l.count > 11 else { return nil }
+            guard l.hasPrefix("["), l.count >= 10 else { return nil }
             let chars = Array(l)
-            guard chars[9] == "]", chars[3] == ":", chars[6] == ":" else { return nil }
+            guard chars[9] == "]", chars[3] == ":", chars[6] == ":",
+                  chars.count == 10 || chars[10].isWhitespace else { return nil }
             let time = String(chars[1..<9])
             guard time.allSatisfy({ $0.isNumber || $0 == ":" }) else { return nil }
-            return (time, String(chars[10...]).trimmingCharacters(in: .whitespaces))
+            let text = chars.count == 10 ? "" : String(chars[10...]).trimmingCharacters(in: .whitespaces)
+            return (time, text)
         }
     }
 }
@@ -108,26 +111,69 @@ public struct DeliveryResult: Sendable {
 }
 
 public enum Deliverer {
-    /// 复制到目标目录:临时名写入 → 校验大小 → 重命名。目录同名自动追加序号,绝不覆盖。
-    public static func deliver(base: String, audio: URL?, markdown: URL, to root: URL) throws -> DeliveryResult {
-        let dir = try Paths.makeUniqueDirectory(in: root, base: base)
-        var audioOut: URL?
-        if let audio {
-            audioOut = try copyVerified(audio, to: dir.appendingPathComponent(audio.lastPathComponent))
+    public static func deliver(base: String, audio: URL?, markdown: URL, to root: URL,
+                               id: UUID = UUID()) throws -> DeliveryResult {
+        let fm = FileManager.default
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        let marker = ".tingjian-delivery-" + id.uuidString
+        let stage = root.appendingPathComponent(marker, isDirectory: true)
+        if let existing = try published(base: base, audioName: audio?.lastPathComponent,
+                                        markdownName: markdown.lastPathComponent, in: root, id: id) {
+            if fm.fileExists(atPath: stage.path) { try fm.trashItem(at: stage, resultingItemURL: nil) }
+            return existing
         }
-        let mdOut = try copyVerified(markdown, to: dir.appendingPathComponent(markdown.lastPathComponent))
-        return DeliveryResult(directory: dir, audio: audioOut, markdown: mdOut)
+        if fm.fileExists(atPath: stage.path) { try fm.trashItem(at: stage, resultingItemURL: nil) }
+        try fm.createDirectory(at: stage, withIntermediateDirectories: false)
+        do {
+            if let audio { try copyVerified(audio, to: stage.appendingPathComponent(audio.lastPathComponent)) }
+            try copyVerified(markdown, to: stage.appendingPathComponent(markdown.lastPathComponent))
+            try Data().write(to: stage.appendingPathComponent(marker), options: .withoutOverwriting)
+            var suffix = 1
+            while true {
+                let name = suffix == 1 ? base : "\(base)_\(suffix)"
+                let target = root.appendingPathComponent(name, isDirectory: true)
+                // A same-volume exclusive rename publishes the complete directory at once.
+                if renamex_np(stage.path, target.path, UInt32(RENAME_EXCL)) == 0 {
+                    return DeliveryResult(directory: target,
+                                          audio: audio.map { target.appendingPathComponent($0.lastPathComponent) },
+                                          markdown: target.appendingPathComponent(markdown.lastPathComponent))
+                }
+                let failure = errno
+                guard failure == EEXIST else { throw POSIXError(POSIXErrorCode(rawValue: failure) ?? .EIO) }
+                suffix += 1
+            }
+        } catch {
+            try? fm.trashItem(at: stage, resultingItemURL: nil)
+            throw error
+        }
     }
 
-    static func copyVerified(_ src: URL, to dst: URL) throws -> URL {
+    static func published(base: String, audioName: String?, markdownName: String,
+                          in root: URL, id: UUID) throws -> DeliveryResult? {
         let fm = FileManager.default
-        let tmp = dst.deletingLastPathComponent().appendingPathComponent(".\(dst.lastPathComponent).partial")
-        if fm.fileExists(atPath: tmp.path) { try fm.trashItem(at: tmp, resultingItemURL: nil) }
-        try fm.copyItem(at: src, to: tmp)
-        let a = (try fm.attributesOfItem(atPath: src.path)[.size] as? NSNumber)?.int64Value ?? -1
-        let b = (try fm.attributesOfItem(atPath: tmp.path)[.size] as? NSNumber)?.int64Value ?? -2
-        guard a == b else { try? fm.trashItem(at: tmp, resultingItemURL: nil); throw ExportError.copyVerify(dst.lastPathComponent) }
-        try fm.moveItem(at: tmp, to: dst)
-        return dst
+        guard fm.fileExists(atPath: root.path) else { return nil }
+        let marker = ".tingjian-delivery-" + id.uuidString
+        let directories = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                                                       options: .skipsHiddenFiles)
+        for directory in directories where directory.lastPathComponent == base || directory.lastPathComponent.hasPrefix(base + "_") {
+            let values = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values.isDirectory == true, values.isSymbolicLink != true,
+                  fm.fileExists(atPath: directory.appendingPathComponent(marker).path) else { continue }
+            let markdown = directory.appendingPathComponent(markdownName)
+            let audio = audioName.map { directory.appendingPathComponent($0) }
+            guard fm.fileExists(atPath: markdown.path), audio.map({ fm.fileExists(atPath: $0.path) }) ?? true else {
+                throw ExportError.copyVerify(directory.lastPathComponent)
+            }
+            return DeliveryResult(directory: directory, audio: audio, markdown: markdown)
+        }
+        return nil
+    }
+
+    static func copyVerified(_ source: URL, to target: URL) throws {
+        let fm = FileManager.default
+        try fm.copyItem(at: source, to: target)
+        let a = (try fm.attributesOfItem(atPath: source.path)[.size] as? NSNumber)?.int64Value ?? -1
+        let b = (try fm.attributesOfItem(atPath: target.path)[.size] as? NSNumber)?.int64Value ?? -2
+        guard a == b else { throw ExportError.copyVerify(target.lastPathComponent) }
     }
 }

@@ -2,6 +2,74 @@ import AppKit
 import SwiftUI
 import TingjianCore
 
+private enum WorkspaceDragItem: Codable {
+    case draft(UUID)
+    case file(URL)
+
+    static let type = "com.local.tingjian.workspace-item"
+
+    func provider() -> NSItemProvider {
+        let provider = NSItemProvider()
+        guard let data = try? JSONEncoder().encode(self) else { return provider }
+        provider.registerDataRepresentation(forTypeIdentifier: Self.type, visibility: .ownProcess) { completion in
+            completion(data, nil)
+            return nil
+        }
+        return provider
+    }
+
+    static func receive(_ providers: [NSItemProvider], in directory: URL, model: AppModel) -> Bool {
+        guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(type) }) else {
+            return false
+        }
+        _ = provider.loadDataRepresentation(forTypeIdentifier: type) { data, _ in
+            Task { @MainActor in
+                guard let data, let item = try? JSONDecoder().decode(Self.self, from: data) else {
+                    model.libraryNotice = "无法读取拖入的项目，请重试。"
+                    return
+                }
+                switch item {
+                case .draft(let id):
+                    await model.placeDraft(id, in: directory)
+                case .file(let url):
+                    model.requestMove(url, into: directory)
+                }
+            }
+        }
+        return true
+    }
+}
+
+private final class DropHighlight: ObservableObject {
+    @Published var targeted = false
+}
+
+private struct WorkspaceRefreshButton: View {
+    let title: String
+    let refreshing: Bool
+    let action: @MainActor () async -> Void
+
+    var body: some View {
+        Button {
+            Task { await action() }
+        } label: {
+            Group {
+                if refreshing {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                }
+            }
+            .frame(width: 16, height: 16)
+        }
+        .buttonStyle(.borderless)
+        .disabled(refreshing)
+        .help(title)
+        .accessibilityLabel(title)
+        .accessibilityValue(refreshing ? "刷新中" : "")
+    }
+}
+
 private struct TranscriptScrollSnapshot: Equatable {
     let contentHeight: CGFloat
     let distanceFromBottom: CGFloat
@@ -21,14 +89,27 @@ struct ContentView: View {
             } detail: {
                 detailPane
             }
-            .onChange(of: geo.size.width, initial: true) { _, width in
-                if width < 860, model.columnVisibility != .detailOnly { model.columnVisibility = .detailOnly }
+            .onChange(of: geo.size.width, initial: true) { previousWidth, width in
+                if width < 860, (previousWidth >= 860 || previousWidth == width), model.columnVisibility != .detailOnly {
+                    model.sidebarHiddenForWidth = true
+                    model.columnVisibility = .detailOnly
+                } else if width >= 860, model.sidebarHiddenForWidth {
+                    model.sidebarHiddenForWidth = false
+                    model.columnVisibility = .all
+                }
+            }
+            .onChange(of: model.columnVisibility) { _, visibility in
+                if visibility != .detailOnly { model.sidebarHiddenForWidth = false }
             }
         }
         .frame(minWidth: 620, minHeight: 560)
         .foregroundStyle(TingjianTheme.ink)
         .tint(TingjianTheme.accent)
         .toolbar { toolbarContent }
+        .sheet(isPresented: $model.needsInitialSetup) {
+            InitialSetupView()
+                .interactiveDismissDisabled()
+        }
         .sheet(item: $model.renameRequest) { request in
             RenameSheet(request: request)
         }
@@ -52,6 +133,11 @@ struct ContentView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            if model.columnVisibility == .detailOnly {
+                Button { model.newRecording() } label: {
+                    Label("新建录音", systemImage: "record.circle")
+                }
+            }
             Menu {
                 Button("更改保存位置…") { model.chooseSaveRoot() }
                     .disabled(rec.isActive)
@@ -74,8 +160,7 @@ struct ContentView: View {
     private var detailPane: some View {
         VStack(spacing: 0) {
             header
-            if !model.openTabs.isEmpty { tabBar }
-            if rec.isActive, !isCurrentRecording {
+            if model.recordingBusy, !model.isRecordingSelection {
                 recordingBanner
             }
             if let banner = severeBanner {
@@ -90,22 +175,13 @@ struct ContentView: View {
         .background(TingjianPaperBackground())
     }
 
-    private var isCurrentRecording: Bool { model.selection == .currentRecording }
+    private var isCurrentRecording: Bool { model.isRecordingSelection }
 
     private var header: some View {
         HStack(spacing: 12) {
-            if model.columnVisibility == .detailOnly {
-                Button {
-                    model.columnVisibility = .all
-                } label: {
-                    Image(systemName: "sidebar.left")
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("显示项目列表")
-                .help("显示项目列表")
-            }
-
-            if case .currentRecording = model.selection {
+            if !model.openTabs.isEmpty {
+                tabBar.frame(maxWidth: .infinity)
+            } else if isCurrentRecording || model.selection.draftID != nil {
                 Text(contextTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1)
             } else if case .directory = model.selection {
                 Text(contextTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1)
@@ -114,53 +190,11 @@ struct ContentView: View {
 
             Spacer(minLength: 12)
 
-            Button {
-                Task { await model.reloadOpenContent() }
-            } label: {
-                Image(systemName: "arrow.clockwise")
+            WorkspaceRefreshButton(title: "刷新当前内容", refreshing: model.refreshingContent) {
+                await model.refreshOpenContent()
             }
-            .buttonStyle(.borderless)
-            .help("重新读取当前内容")
-            .accessibilityLabel("刷新当前内容")
 
             selectedItemMenu
-
-            if model.columnVisibility == .detailOnly, !rec.isActive, !isCurrentRecording {
-                Button {
-                    model.newRecording()
-                } label: {
-                    Label("新建录音", systemImage: "record.circle")
-                }
-                .buttonStyle(.borderless)
-                .disabled(rec.isActive)
-            }
-
-            if isCurrentRecording, rec.phase == .idle || rec.phase == .finished, !rec.isActive {
-                TextField("课程名称(可选)", text: $model.course)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12, weight: .medium))
-                    .frame(minWidth: 120, idealWidth: 180, maxWidth: 220)
-                    .accessibilityLabel("课程名称")
-                    .help("课程名称会用于录音文件夹和 Markdown 标题")
-                Button {
-                    model.beginRecording()
-                } label: {
-                    Label("开始", systemImage: "record.circle")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(TingjianTheme.record)
-                .controlSize(.small)
-                .keyboardShortcut(.return, modifiers: .command)
-                .disabled(!model.canStartRecording)
-            }
-
-            if rec.isActive {
-                Text(Timecode.string(rec.duration))
-                    .font(.system(size: 20, weight: .medium, design: .monospaced))
-                    .monospacedDigit()
-                    .foregroundStyle(rec.phase == .paused ? TingjianTheme.secondaryInk : TingjianTheme.ink)
-                    .accessibilityLabel("录音时长 \(Timecode.string(rec.duration))")
-            }
         }
         .padding(.horizontal, 14)
         .frame(height: 40)
@@ -170,8 +204,8 @@ struct ContentView: View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal) {
                 HStack(spacing: 2) {
-                    ForEach(model.openTabs, id: \.standardizedFileURL) { tab in
-                        let active = model.selection.url?.standardizedFileURL == tab.standardizedFileURL
+                    ForEach(model.openTabs, id: \.self) { tab in
+                        let active = model.selectedFileTab == tab
                         HStack(spacing: 5) {
                             Image(systemName: ProjectLibrary.isAudio(tab) ? "waveform" : "doc.text")
                                 .font(.system(size: 10))
@@ -190,18 +224,18 @@ struct ContentView: View {
                                     .frame(width: 16, height: 16)
                             }
                             .buttonStyle(.borderless)
-                            .accessibilityLabel("关闭 \(tab.lastPathComponent)")
+                            .accessibilityLabel("关闭 \(tabTitle(for: tab))")
                         }
                         .padding(.leading, 8)
                         .padding(.trailing, 4)
                         .frame(height: 28)
                         .background(RoundedRectangle(cornerRadius: 5).fill(active ? TingjianTheme.controlSurface : .clear))
                         .contentShape(Rectangle())
-                        .id(tab.standardizedFileURL)
+                        .id(tab)
                         .contextMenu {
                             Button("关闭标签页") { model.closeTab(tab) }
-                            Button("关闭其他标签页") { model.closeOtherTabs(keeping: tab) }
-                            Button("关闭右侧标签页") { model.closeTabsToRight(of: tab) }
+                            Button("关闭其他文件标签") { model.closeOtherTabs(keeping: tab) }
+                            Button("关闭右侧文件标签") { model.closeTabsToRight(of: tab) }
                                 .disabled(model.openTabs.last == tab)
                         }
                     }
@@ -209,14 +243,12 @@ struct ContentView: View {
                 .padding(.horizontal, 10)
             }
             .scrollIndicators(.hidden)
-            .onChange(of: model.selection.url?.standardizedFileURL) { _, url in
-                guard let url, model.openTabs.contains(url) else { return }
-                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(url, anchor: .center) }
+            .onChange(of: model.selectedFileTab) { _, tab in
+                guard let tab else { return }
+                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(tab, anchor: .center) }
             }
             .onAppear {
-                if let url = model.selection.url?.standardizedFileURL, model.openTabs.contains(url) {
-                    proxy.scrollTo(url, anchor: .center)
-                }
+                if let tab = model.selectedFileTab { proxy.scrollTo(tab, anchor: .center) }
             }
         }
         .frame(height: 34)
@@ -264,29 +296,29 @@ struct ContentView: View {
                     .disabled(!model.llmConfigured || model.isCorrecting || rec.isActive)
                     Divider()
                     Button("重命名…") { model.requestRename(document) }.disabled(rec.isActive)
-                    Button("移动到…") { model.chooseMoveDestination(for: model.dragUnit(for: document)) }.disabled(rec.isActive)
+                    Button("移动到…") { model.requestMove(document) }.disabled(rec.isActive)
                     Button("在 Finder 中显示") { NSWorkspace.shared.activateFileViewerSelecting([document]) }
                     Button("复制路径") { copyPath(document.path) }
                     Divider()
                     Button("移入废纸篓…", role: .destructive) { model.requestTrash(document) }.disabled(rec.isActive)
                 case .audio(let audio):
                     Button("重命名…") { model.requestRename(audio) }.disabled(rec.isActive)
-                    Button("移动到…") { model.chooseMoveDestination(for: model.dragUnit(for: audio)) }.disabled(rec.isActive)
+                    Button("移动到…") { model.requestMove(audio) }.disabled(rec.isActive)
                     Button("在 Finder 中显示") { NSWorkspace.shared.activateFileViewerSelecting([audio]) }
                     Button("复制路径") { copyPath(audio.path) }
                     Divider()
                     Button("移入废纸篓…", role: .destructive) { model.requestTrash(audio) }.disabled(rec.isActive)
                 case .directory(let directory):
-                    Button("在此录音") { model.recordingProject = directory; model.select(.currentRecording) }.disabled(rec.isActive)
-                    Button("在此新建项目…") { model.recordingProject = directory; model.newProjectRequest = true }
+                    Button("在此录音") { model.newRecording(in: directory) }
+                    Button("在此新建项目…") { model.select(.directory(directory)); model.newProjectRequest = true }
                     Divider()
-                    Button("重命名…") { model.requestRename(directory) }.disabled(rec.isActive)
-                    Button("移动到…") { model.chooseMoveDestination(for: directory) }.disabled(rec.isActive)
+                    Button("重命名…") { model.requestRename(directory) }.disabled(rec.isActive || !model.canModifyLibrarySelection)
+                    Button("移动到…") { model.requestMove(directory) }.disabled(rec.isActive || !model.canModifyLibrarySelection)
                     Button("在 Finder 中显示") { NSWorkspace.shared.activateFileViewerSelecting([directory]) }
                     Button("复制路径") { copyPath(directory.path) }
                     Divider()
-                    Button("移入废纸篓…", role: .destructive) { model.requestTrash(directory) }.disabled(rec.isActive)
-                case .currentRecording:
+                    Button("移入废纸篓…", role: .destructive) { model.requestTrash(directory) }.disabled(rec.isActive || !model.canModifyLibrarySelection)
+                case .currentRecording, .draft:
                     EmptyView()
                 }
             } label: {
@@ -295,6 +327,21 @@ struct ContentView: View {
             .menuStyle(.borderlessButton)
             .accessibilityLabel("当前项目操作")
             .help(url.path)
+        } else if let id = model.selection.draftID {
+            Menu {
+                Button("选择保存位置…") { model.chooseDraftPlacement(id) }
+                    .disabled(model.isDraftLocked(id))
+                if let folder = model.recordingDestination(for: id), !model.isRootDirectory(folder) {
+                    Button("改存到根目录") { model.useRoot(for: id) }
+                        .disabled(model.isDraftLocked(id))
+                }
+                Button("关闭草稿") { model.closeDraft(id) }
+                    .disabled(model.isDraftLocked(id))
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel("草稿操作")
         }
     }
 
@@ -302,8 +349,10 @@ struct ContentView: View {
         switch model.selection {
         case .currentRecording:
             return rec.courseName.isEmpty ? "当前录音" : rec.courseName
+        case .draft(let id):
+            return model.draft(id: id)?.title ?? "未命名录音"
         case .directory(let url):
-            return url.lastPathComponent
+            return model.isRootDirectory(url) ? "资料库根目录" : url.lastPathComponent
         case .document(let url), .audio(let url):
             return url.lastPathComponent
         }
@@ -312,7 +361,9 @@ struct ContentView: View {
     private var contextPath: String {
         switch model.selection {
         case .currentRecording:
-            return model.recordingProject.path
+            return rec.sessionDestination.path
+        case .draft(let id):
+            return model.recordingDestination(for: id)?.path ?? ""
         case .directory(let url), .document(let url), .audio(let url):
             return url.path
         }
@@ -321,16 +372,23 @@ struct ContentView: View {
     private var recordingBanner: some View {
         HStack(spacing: 8) {
             Circle().fill(TingjianTheme.record).frame(width: 7, height: 7)
-            Text(rec.phase == .paused ? "正在录音(已暂停) · 返回当前录音" : "正在录音 · 返回当前录音")
+            Text(recordingBannerText)
                 .font(.system(size: 12, weight: .medium))
             Spacer()
-            Button("查看") { model.select(.currentRecording) }
+            Button("查看") { model.showCurrentRecording() }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
         .background(TingjianTheme.record.opacity(0.07))
+    }
+
+    private var recordingBannerText: String {
+        if rec.phase == .paused { return "录音已暂停" }
+        if rec.phase == .finalizing { return "正在保存录音" }
+        if !rec.isActive { return "录音等待保存" }
+        return "正在录音"
     }
 
     private var severeBanner: IssueItem? {
@@ -367,7 +425,7 @@ struct ContentView: View {
     @ViewBuilder
     private var content: some View {
         switch model.selection {
-        case .currentRecording:
+        case .currentRecording, .draft:
             CurrentRecordingView(seekMessage: $model.seekMessage)
         case .directory(let url):
             DirectoryDetail(url: url)
@@ -461,8 +519,7 @@ private struct SidebarPanel: View {
                         .font(.system(size: 12, weight: .medium))
                 }
                 .buttonStyle(.borderless)
-                .disabled(rec.isActive)
-                .help("新建录音(⌘N):清空课程名并回到当前录音")
+                .help("新建录音（⌘N），默认保存到资料库根目录")
 
                 Spacer(minLength: 4)
 
@@ -475,21 +532,26 @@ private struct SidebarPanel: View {
                 .help("在当前文件夹新建项目")
                 .accessibilityLabel("新建项目")
 
-                Button {
-                    Task { await model.reloadLibrary() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+                WorkspaceRefreshButton(title: "刷新项目列表", refreshing: model.refreshingLibrary) {
+                    await model.refreshLibrary()
                 }
-                .buttonStyle(.borderless)
-                .help("刷新项目列表")
-                .accessibilityLabel("刷新项目列表")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    CurrentRecordingRow()
+                    RootDirectoryRow()
+
+                    Text("暂存")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(TingjianTheme.tertiaryInk)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 5.3)
+                        .accessibilityAddTraits(.isHeader)
+                    ForEach(model.drafts) { draft in
+                        RecordingDraftRow(draft: draft)
+                    }
 
                     if let entries = model.childrenByDirectory[model.saveRoot.standardizedFileURL] {
                         if entries.isEmpty {
@@ -504,7 +566,7 @@ private struct SidebarPanel: View {
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundStyle(TingjianTheme.tertiaryInk)
                                 .padding(.horizontal, 12)
-                                .padding(.top, 8)
+                                .padding(.top, 8.45)
                                 .padding(.bottom, 2)
                                 .accessibilityAddTraits(.isHeader)
                             ForEach(entries) { entry in
@@ -533,11 +595,11 @@ private struct SidebarPanel: View {
             }
             .contextMenu {
                 Button("在资料库根目录新建项目…") {
-                    model.recordingProject = model.saveRoot
                     model.select(.directory(model.saveRoot))
                     model.newProjectRequest = true
                 }
-                Button("刷新项目树") { Task { await model.reloadLibrary() } }
+                Button("刷新项目树") { Task { await model.refreshLibrary() } }
+                    .disabled(model.refreshingLibrary)
                 Button("折叠全部文件夹") { model.collapseAllDirectories() }
                 Divider()
                 Button("在 Finder 中显示资料库") {
@@ -546,6 +608,7 @@ private struct SidebarPanel: View {
             }
             .onMoveCommand(perform: model.navigateSidebar)
             .focusable()
+            .focusEffectDisabled()
 
             Rectangle().fill(TingjianTheme.hairline).frame(height: 1)
 
@@ -576,40 +639,91 @@ private struct SidebarPanel: View {
     }
 }
 
-private struct CurrentRecordingRow: View {
+private struct RecordingDraftRow: View {
+    let draft: RecordingDraft
     @EnvironmentObject private var model: AppModel
-    @EnvironmentObject private var rec: Recorder
 
-    private var selected: Bool { model.selection == .currentRecording }
+    private var isSelected: Bool { model.selection.draftID == draft.id }
+    private var isLocked: Bool { model.isDraftLocked(draft.id) }
+
+    private var row: some View {
+        HStack(spacing: 6) {
+            Button { model.select(.draft(draft.id)) } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: model.activeDraftID == draft.id ? "waveform" : "record.circle")
+                        .frame(width: 14)
+                        .accessibilityHidden(true)
+                    Text(draft.title).lineLimit(1)
+                    Spacer(minLength: 4)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+            .help(model.recordingDestination(for: draft.id)?.path ?? draft.title)
+
+            Button { model.closeDraft(draft.id) } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .frame(width: 18, height: 18)
+            }
+            .buttonStyle(.borderless)
+            .disabled(isLocked)
+            .accessibilityLabel("关闭 \(draft.title)")
+        }
+        .font(.system(size: 12))
+        .padding(.leading, 12)
+        .padding(.trailing, 6)
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 6).fill(isSelected ? TingjianTheme.accentSoft : .clear))
+        .contextMenu {
+            Button("选择保存位置…") { model.chooseDraftPlacement(draft.id) }
+                .disabled(isLocked)
+            Button("关闭草稿") { model.closeDraft(draft.id) }
+                .disabled(isLocked)
+        }
+    }
 
     var body: some View {
-        Button {
-            model.select(.currentRecording)
-        } label: {
+        if isLocked { row }
+        else { row.onDrag { WorkspaceDragItem.draft(draft.id).provider() } }
+    }
+}
+
+private struct RootDirectoryRow: View {
+    @EnvironmentObject private var model: AppModel
+    @StateObject private var dropHighlight = DropHighlight()
+
+    private var selected: Bool {
+        if case .directory(let url) = model.selection { return model.isRootDirectory(url) }
+        return false
+    }
+
+    var body: some View {
+        Button { model.select(.directory(model.saveRoot)) } label: {
             HStack(spacing: 7) {
-                Image(systemName: rec.phase == .recording ? "waveform" : "waveform.circle")
+                Image(systemName: "folder")
                     .font(.system(size: 11))
-                    .foregroundStyle(rec.isActive ? TingjianTheme.record : TingjianTheme.accent)
+                    .foregroundStyle(TingjianTheme.accent)
                     .frame(width: 14)
-                Text("当前录音")
+                Text("资料库根目录")
                     .font(.system(size: 12, weight: .medium))
                 Spacer(minLength: 4)
-                if rec.isActive {
-                    Text(Timecode.string(rec.duration))
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(TingjianTheme.secondaryInk)
-                        .monospacedDigit()
-                }
             }
             .padding(.leading, 12)
             .padding(.trailing, 6)
             .padding(.vertical, 5)
-            .background(RoundedRectangle(cornerRadius: 6).fill(selected ? TingjianTheme.accentSoft : Color.clear))
+            .background(RoundedRectangle(cornerRadius: 6).fill(
+                selected || dropHighlight.targeted ? TingjianTheme.accentSoft : Color.clear))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("当前录音")
+        .onDrop(of: [WorkspaceDragItem.type], isTargeted: $dropHighlight.targeted) { providers in
+            WorkspaceDragItem.receive(providers, in: model.saveRoot, model: model)
+        }
         .accessibilityAddTraits(selected ? [.isSelected] : [])
+        .help(model.saveRoot.path)
     }
 }
 
@@ -617,6 +731,7 @@ private struct SidebarRow: View {
     let entry: LibraryEntry
     let depth: Int
     @EnvironmentObject private var model: AppModel
+    @StateObject private var dropHighlight = DropHighlight()
 
     private var key: URL { entry.url.standardizedFileURL }
     private var expanded: Bool { model.expandedDirectories.contains(key) }
@@ -624,7 +739,7 @@ private struct SidebarRow: View {
 
     private var icon: String {
         switch entry.kind {
-        case .directory: return entry.isRecordingBundle ? "waveform.badge.mic" : "folder"
+        case .directory: return model.isRecordingDirectory(entry.url) ? "waveform.badge.mic" : "folder"
         case .audio: return "waveform"
         case .document: return "doc.text"
         }
@@ -647,7 +762,7 @@ private struct SidebarRow: View {
         }
     }
 
-    private var row: some View {
+    private var draggableRow: some View {
         HStack(spacing: 4) {
             if entry.kind == .directory {
                 Button { model.toggleExpansion(entry.url) } label: {
@@ -674,14 +789,14 @@ private struct SidebarRow: View {
                     .font(.system(size: 12))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                if entry.isRecordingBundle, entry.kind == .directory {
+                if model.isRecordingDirectory(entry.url), entry.kind == .directory {
                     Circle().fill(TingjianTheme.record).frame(width: 4, height: 4)
                 }
                 Spacer(minLength: 0)
                 }
                 .padding(.trailing, 6)
                 .padding(.vertical, 4)
-                .background(RoundedRectangle(cornerRadius: 6).fill(selected ? TingjianTheme.accentSoft : Color.clear))
+                .background(RoundedRectangle(cornerRadius: 6).fill(selected || dropHighlight.targeted ? TingjianTheme.accentSoft : Color.clear))
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -690,11 +805,17 @@ private struct SidebarRow: View {
         }
         .padding(.leading, CGFloat(depth) * 14 + 8)
         .contextMenu { menu }
-        .draggable(model.dragUnit(for: entry.url))
-        .dropDestination(for: URL.self) { urls, _ in
-            guard entry.kind == .directory, let dragged = urls.first else { return false }
-            Task { await model.moveEntry(dragged, into: entry.url) }
-            return true
+        .onDrag { WorkspaceDragItem.file(entry.url).provider() }
+    }
+
+    @ViewBuilder
+    private var row: some View {
+        if entry.kind == .directory {
+            draggableRow.onDrop(of: [WorkspaceDragItem.type], isTargeted: $dropHighlight.targeted) { providers in
+                WorkspaceDragItem.receive(providers, in: entry.url, model: model)
+            }
+        } else {
+            draggableRow
         }
     }
 
@@ -746,12 +867,9 @@ private struct SidebarRow: View {
             Button("打开文件夹") { model.select(.directory(entry.url)) }
             Divider()
             Button("在此录音") {
-                model.recordingProject = entry.url
-                model.select(.currentRecording)
+                model.newRecording(in: entry.url)
             }
-            .disabled(model.recorder.isActive)
             Button("在此新建项目…") {
-                model.recordingProject = entry.url
                 model.select(.directory(entry.url))
                 model.newProjectRequest = true
             }
@@ -765,7 +883,7 @@ private struct SidebarRow: View {
         Button("重命名…") { model.requestRename(entry.url) }
             .disabled(model.recorder.isActive)
         Button("移动到…") {
-            model.chooseMoveDestination(for: entry.url)
+            model.requestMove(entry.url)
         }
             .disabled(model.recorder.isActive)
         Divider()
@@ -799,8 +917,11 @@ private struct RenameSheet: View {
             TextField(isDirectory ? "新名称" : "新名称(扩展名保持不变)", text: $model.renameDraft)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(commit)
+            if isDirectory {
+                Toggle("同步更换直属文件名前缀", isOn: $model.syncRenamePrefixes)
+            }
             Text(isDirectory
-                 ? "只改变文件夹名;内部文件名与文稿正文保持不变。"
+                 ? "仅替换直属文件名中与原项目名相同的开头，不修改子文件夹。"
                  : "同目录文稿中的音频引用与来源链接会同步更新;同名目标会被拒绝。")
                 .font(.system(size: 11))
                 .foregroundStyle(TingjianTheme.secondaryInk)
@@ -816,13 +937,17 @@ private struct RenameSheet: View {
         }
         .padding(18)
         .frame(width: 430)
-        .onAppear { model.renameDraft = isDirectory ? request.url.lastPathComponent : request.url.deletingPathExtension().lastPathComponent }
+        .onAppear {
+            model.syncRenamePrefixes = false
+            model.renameDraft = isDirectory ? request.url.lastPathComponent : request.url.deletingPathExtension().lastPathComponent
+        }
     }
 
     private func commit() {
         let value = model.renameDraft
         dismiss()
-        Task { await model.renameEntry(request.url, to: value) }
+        let sync = model.syncRenamePrefixes
+        Task { await model.renameEntry(request.url, to: value, syncFilePrefixes: sync) }
     }
 }
 
@@ -875,6 +1000,7 @@ private struct CurrentRecordingView: View {
     @Binding var seekMessage: String?
 
     private var showsLiveTranscript: Bool {
+        guard model.isRecordingSelection else { return false }
         switch rec.phase {
         case .starting, .recording, .paused, .finalizing: return true
         case .finished:
@@ -890,7 +1016,7 @@ private struct CurrentRecordingView: View {
             if showsLiveTranscript {
                 transcript(usesGutter: usesGutter)
             } else {
-                emptyDraft
+                emptyDraft(height: geo.size.height)
             }
         }
     }
@@ -947,32 +1073,136 @@ private struct CurrentRecordingView: View {
         }
     }
 
-    private var emptyDraft: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Image(systemName: "waveform.circle")
-                .font(.system(size: 24, weight: .medium))
-                .foregroundStyle(TingjianTheme.accent)
-            Text("从一节课开始")
-                .font(.system(size: 22, weight: .semibold))
-            Text("点击开始后,确认文字会按时间出现在这里。音频与文稿会保存到 \(model.recordingProject.path)。")
-                .font(.system(size: 14))
-                .foregroundStyle(TingjianTheme.secondaryInk)
-                .lineSpacing(4)
-                .frame(maxWidth: 520, alignment: .leading)
-            Text("⌘↩ 开始录音")
-                .font(.system(size: 12, weight: .medium, design: .rounded))
-                .foregroundStyle(TingjianTheme.tertiaryInk)
-                .padding(.top, 2)
-            if model.savedInputUnavailable {
-                Label("保存的输入设备不可用,请先在设置中选择输入设备。", systemImage: "mic.slash")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(TingjianTheme.warning)
+    private func emptyDraft(height: CGFloat) -> some View {
+        let outerRowHeight: CGFloat = 32
+        return ScrollView {
+            VStack(spacing: 26.4) {
+                HStack(spacing: 10) {
+                    Image(systemName: "waveform.circle")
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(TingjianTheme.accent)
+                        .accessibilityHidden(true)
+                    Text("从一节课开始")
+                        .font(.system(size: 22, weight: .semibold))
+                        .accessibilityAddTraits(.isHeader)
+                }
+                .frame(height: outerRowHeight)
+                if let id = model.selection.draftID, !model.isDraftLocked(id) {
+                    TextField("课程名称（可选）", text: Binding(
+                        get: { model.draft(id: id)?.name ?? "" },
+                        set: { model.renameDraft(id: id, to: $0) }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 280)
+                    .accessibilityLabel("课程名称")
+                    .help("课程名称会用于录音文件夹和 Markdown 标题")
+                }
+                VStack(spacing: 7) {
+                    Text("音频与文稿保存到")
+                        .font(.system(size: 14))
+                        .foregroundStyle(TingjianTheme.secondaryInk)
+                    if let id = model.selection.draftID, let folder = model.recordingDestination(for: id) {
+                        recordingFolderLink(folder)
+                        if !model.isDraftLocked(id) {
+                            Button("选择保存位置…") { model.chooseDraftPlacement(id) }
+                                .buttonStyle(.link)
+                                .font(.system(size: 12))
+                        }
+                        if !model.isRootDirectory(folder), !model.isDraftLocked(id) {
+                            Button("改存到根目录") { model.useRoot(for: id) }
+                                .buttonStyle(.link)
+                                .font(.system(size: 12))
+                        }
+                        if model.isDraftLocked(id), model.activeDraftID != id {
+                            Text("录音已中断，可恢复并保存")
+                                .font(.system(size: 12))
+                                .foregroundStyle(TingjianTheme.warning)
+                        }
+                        if let issue = model.recordingTargetIssue(for: id) {
+                            Text(issue)
+                                .font(.system(size: 12))
+                                .foregroundStyle(TingjianTheme.warning)
+                        }
+                    }
+
+                    if model.recordingBusy {
+                        Text("另一份录音正在进行或等待保存")
+                            .font(.system(size: 12))
+                            .foregroundStyle(TingjianTheme.secondaryInk)
+                    }
+
+                    if model.savedInputUnavailable {
+                        Label("保存的输入设备不可用，请先在设置中选择输入设备。", systemImage: "mic.slash")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(TingjianTheme.warning)
+                            .padding(.top, 3)
+                    }
+                }
+                if let id = model.selection.draftID {
+                    if model.isDraftLocked(id), model.activeDraftID != id {
+                        Button("恢复并保存") { Task { await model.recoverDraft(id) } }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(model.recordingBusy)
+                    } else {
+                        Button { model.beginRecording() } label: {
+                            HStack(spacing: 10) {
+                                Text("开始录音").fontWeight(.semibold)
+                                Text("⌘↩").font(.system(.caption, design: .monospaced))
+                            }
+                            .padding(.horizontal, 8)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(TingjianTheme.record)
+                        .controlSize(.large)
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .disabled(!model.canStartRecording)
+                        .accessibilityLabel("开始录音")
+                        .accessibilityIdentifier("start")
+                    }
+                }
             }
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 600)
+            .padding(.horizontal, 28)
+            .padding(.vertical, 32)
+            .frame(maxWidth: .infinity, minHeight: height)
         }
-        .padding(.horizontal, 24)
-        .padding(.top, 48)
-        .frame(maxWidth: 960, alignment: .leading)
-        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    private func recordingFolderLink(_ folder: URL) -> some View {
+        Text((folder.path as NSString).abbreviatingWithTildeInPath)
+            .font(.system(size: 14))
+            .foregroundStyle(TingjianTheme.accent)
+            .lineSpacing(4)
+            .fixedSize(horizontal: false, vertical: true)
+            .contentShape(Rectangle())
+            .gesture(
+                TapGesture().modifiers(.command)
+                    .onEnded { openRecordingFolder(folder) }
+                    .exclusively(before: TapGesture(count: 2).onEnded { openRecordingFolder(folder) })
+            )
+            .help("按住 ⌘ 单击或双击，在 Finder 中打开")
+            .accessibilityAddTraits(.isLink)
+            .accessibilityHint("在 Finder 中打开录音保存位置")
+            .accessibilityAction { openRecordingFolder(folder) }
+    }
+
+    private func openRecordingFolder(_ folder: URL) {
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory),
+           isDirectory.boolValue, NSWorkspace.shared.open(folder) {
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "录音保存位置不可用"
+        alert.informativeText = folder.path
+        alert.addButton(withTitle: "好")
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     private var emptyTranscript: some View {
@@ -1036,20 +1266,19 @@ private struct DirectoryDetail: View {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(url.lastPathComponent).font(.system(size: 22, weight: .semibold))
-                        Text(ProjectLibrary.isRecordingBundle(url) ? "录音文件夹" : "项目文件夹")
+                        Text(model.isRootDirectory(url) ? "资料库根目录" : (ProjectLibrary.isRecordingBundle(url) ? "录音文件夹" : "项目文件夹"))
                             .font(.system(size: 12))
                             .foregroundStyle(TingjianTheme.secondaryInk)
                     }
                     Spacer()
                     Button {
-                        model.recordingProject = url
-                        model.select(.currentRecording)
+                        model.newRecording(in: url)
                     } label: {
                         Label("在此录音", systemImage: "record.circle")
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(TingjianTheme.accent)
-                    .disabled(rec.isActive || !model.canStartRecording)
+
                     Button("新建项目…") { model.newProjectRequest = true }
                         .buttonStyle(.bordered)
                 }
@@ -1102,12 +1331,12 @@ private struct DirectoryRow: View {
             }
         } label: {
             HStack(spacing: 10) {
-                Image(systemName: entry.kind == .directory ? (entry.isRecordingBundle ? "waveform.badge.mic" : "folder")
+                Image(systemName: entry.kind == .directory ? (model.isRecordingDirectory(entry.url) ? "waveform.badge.mic" : "folder")
                                   : (entry.kind == .audio ? "waveform" : "doc.text"))
                     .foregroundStyle(entry.kind == .audio ? TingjianTheme.accent : TingjianTheme.secondaryInk)
                     .frame(width: 16)
                 Text(entry.name).font(.system(size: 13))
-                if entry.isRecordingBundle { Text("录音").font(.system(size: 10)).foregroundStyle(TingjianTheme.record) }
+                if model.isRecordingDirectory(entry.url) { Text("录音").font(.system(size: 10)).foregroundStyle(TingjianTheme.record) }
                 Spacer()
                 Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(TingjianTheme.tertiaryInk)
             }
@@ -1131,13 +1360,13 @@ private struct DirectoryRow: View {
             Button("在 Finder 中显示") { NSWorkspace.shared.activateFileViewerSelecting([entry.url]) }
             Button("重命名…") { model.requestRename(entry.url) }
                 .disabled(rec.isActive)
-            Button("移动到…") { model.chooseMoveDestination(for: entry.url) }
+            Button("移动到…") { model.requestMove(entry.url) }
                 .disabled(rec.isActive)
             Divider()
             Button("移入废纸篓…", role: .destructive) { model.requestTrash(entry.url) }
                 .disabled(rec.isActive)
         }
-        .draggable(model.dragUnit(for: entry.url))
+        .onDrag { WorkspaceDragItem.file(entry.url).provider() }
     }
 }
 
@@ -1191,7 +1420,7 @@ private struct DocumentDetail: View {
                                 .fixedSize(horizontal: false, vertical: true)
                                 .padding(.top, 18)
                         } else {
-                            VStack(alignment: .leading, spacing: 12) {
+                            LazyVStack(alignment: .leading, spacing: 12) {
                                 ForEach(doc.lines) { line in
                                     DocumentLineRow(line: line, usesGutter: usesGutter, seekMessage: $seekMessage)
                                         .id(line.id)
@@ -1323,8 +1552,8 @@ private struct DocumentLineRow: View {
         }
         .buttonStyle(.plain)
         .disabled(!playable)
-        .help(playable ? "从 \(line.time) 开始播放" : "没有可定位的关联音频")
-        .accessibilityLabel("\(line.time) 开始播放")
+        .help(playable ? "从 \(line.time) 定位" : "没有可定位的关联音频")
+        .accessibilityLabel("定位到 \(line.time)")
     }
 
     private var text: some View {
@@ -1370,7 +1599,7 @@ private struct AudioDetail: View {
                 }
                 Button("重命名…") { model.requestRename(url) }
                     .disabled(rec.isActive)
-                Button("移动到…") { model.chooseMoveDestination(for: model.dragUnit(for: url)) }
+                Button("移动到…") { model.requestMove(url) }
                     .disabled(rec.isActive)
             }
             Spacer()
@@ -1385,6 +1614,14 @@ private struct AudioDetail: View {
 // MARK: - 控制带
 
 private struct ControlBand: View {
+    private var displayedPosition: Double { playback.displayedPosition }
+
+    private var progressSlider: some View {
+        Slider(value: Binding(get: { displayedPosition }, set: playback.previewSeek),
+               in: 0...max(playback.duration, 0.01), onEditingChanged: playback.setScrubbing)
+            .disabled(!playback.canSeek)
+    }
+
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var rec: Recorder
     @EnvironmentObject private var playback: PlaybackModel
@@ -1507,11 +1744,9 @@ private struct ControlBand: View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 12) {
                 playPauseButton
-                Text(Timecode.string(playback.position))
+                Text(Timecode.string(displayedPosition))
                     .font(.system(size: 12, design: .monospaced)).monospacedDigit()
-                Slider(value: Binding(get: { playback.position }, set: { playback.seek(to: $0) }),
-                       in: 0...max(playback.duration, 0.01))
-                    .disabled(!playback.canSeek)
+                progressSlider
                     .frame(minWidth: 120)
                 Text(Timecode.string(playback.duration))
                     .font(.system(size: 12, design: .monospaced)).monospacedDigit()
@@ -1521,10 +1756,8 @@ private struct ControlBand: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 10) {
                     playPauseButton
-                    Slider(value: Binding(get: { playback.position }, set: { playback.seek(to: $0) }),
-                           in: 0...max(playback.duration, 0.01))
-                        .disabled(!playback.canSeek)
-                    Text("\(Timecode.string(playback.position)) / \(Timecode.string(playback.duration))")
+                    progressSlider
+                    Text("\(Timecode.string(displayedPosition)) / \(Timecode.string(playback.duration))")
                         .font(.system(size: 11, design: .monospaced)).monospacedDigit()
                 }
                 HStack(spacing: 8) {
@@ -1569,6 +1802,10 @@ private struct ControlBand: View {
                     .font(.system(size: 12))
                     .foregroundStyle(TingjianTheme.warning)
                 Spacer()
+                if model.canChangePendingSaveDestination {
+                    Button("更换保存位置…") { model.choosePendingSaveDestination() }
+                        .buttonStyle(.bordered)
+                }
                 Button {
                     Task { await rec.retrySave() }
                 } label: {
@@ -1581,6 +1818,10 @@ private struct ControlBand: View {
                     .font(.system(size: 12))
                     .foregroundStyle(TingjianTheme.record)
                 Spacer()
+                if model.canChangePendingSaveDestination {
+                    Button("更换保存位置…") { model.choosePendingSaveDestination() }
+                        .buttonStyle(.bordered)
+                }
                 Button {
                     Task { await rec.retrySave() }
                 } label: {
@@ -1602,16 +1843,6 @@ private struct ControlBand: View {
                     .font(.system(size: 12))
                     .foregroundStyle(TingjianTheme.secondaryInk)
                 Spacer()
-                Button {
-                    model.beginRecording()
-                } label: {
-                    Label("开始录音", systemImage: "record.circle")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(TingjianTheme.record)
-                .keyboardShortcut(.return, modifiers: .command)
-                .disabled(!model.canStartRecording)
-                .accessibilityIdentifier("start")
             }
         }
     }
@@ -1810,6 +2041,10 @@ private struct IssuesPopover: View {
         case .retrySave:
             Button("重试保存") { Task { await rec.retrySave() } }
                 .buttonStyle(.borderedProminent).controlSize(.small)
+            if model.canChangePendingSaveDestination {
+                Button("更换保存位置…") { model.choosePendingSaveDestination() }
+                    .buttonStyle(.bordered).controlSize(.small)
+            }
         case .installModel:
             if let progress = rec.modelProgress {
                 ProgressView(value: progress).frame(width: 90)
@@ -1991,4 +2226,44 @@ private func copyPath(_ path: String) {
 
 private func openPath(_ path: String) {
     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+}
+
+
+private struct InitialSetupView: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("设置听笺").font(.title2.weight(.semibold))
+            VStack(alignment: .leading, spacing: 8) {
+                Text("录音与文稿的保存位置").font(.headline)
+                Text((model.saveRoot.path as NSString).abbreviatingWithTildeInPath)
+                    .foregroundStyle(TingjianTheme.secondaryInk)
+                    .textSelection(.enabled)
+                Button("选择文件夹…") { model.chooseSaveRoot() }
+                if let notice = model.libraryNotice {
+                    Text(notice).foregroundStyle(TingjianTheme.warning)
+                }
+            }
+            Divider()
+            Toggle("启用文字纠正", isOn: $model.llmEnabled)
+            Text("可在设置中选择网关和纠正方式。")
+                .foregroundStyle(TingjianTheme.secondaryInk)
+            HStack {
+                Spacer()
+                if model.llmEnabled {
+                    Button("完成并打开设置") {
+                        model.completeInitialSetup()
+                        openSettings()
+                    }
+                }
+                Button("完成设置") { model.completeInitialSetup() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 475)
+    }
 }
