@@ -5,9 +5,10 @@ import TingjianCore
 // 验证工具:合成音频 + 故障注入 + 真实识别。不打开麦克风。
 
 let skipCorrection = CommandLine.arguments.contains("--skip-correction")
-var failures = 0
+private let failureCounter = TestCounter()
+var failures: Int { failureCounter.count }
 func check(_ name: String, _ cond: @autoclosure () async -> Bool, _ detail: String = "") async {
-    if await cond() { print("  ✓ \(name)") } else { failures += 1; print("  ✗ \(name) \(detail)") }
+    if await cond() { print("  ✓ \(name)") } else { failureCounter.increment(); print("  ✗ \(name) \(detail)") }
 }
 func section(_ s: String) { print("\n[\(s)]") }
 
@@ -66,6 +67,57 @@ if CommandLine.arguments.contains("--correction-only") {
     exit(failures == 0 ? 0 : 1)
 }
 
+if CommandLine.arguments.contains("--weak-voice-bench") || CommandLine.arguments.contains("--weak-voice-holdout") {
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    await runWeakVoiceBenchmark(holdout: CommandLine.arguments.contains("--weak-voice-holdout"))
+    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
+    exit(failures == 0 ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--audio-regressions-only") {
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    await reviewRegressionChecks(includeRecognition: false)
+    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
+    exit(failures == 0 ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--long-only") {
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    await longRecordingCheck()
+    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
+    exit(failures == 0 ? 0 : 1)
+}
+
+@MainActor
+func longRecordingCheck() async {
+    section("30 分钟合成音频(模拟引擎):落盘、时长、内存")
+    let long = tmp.appendingPathComponent("long.caf")
+    makeTone(long, seconds: 1800)
+    let local = fresh("long-local"), dest = fresh("long-dest")
+    let r = Recorder(saveRoot: dest, localRoot: local, makeEngine: { MockEngine(.normal) },
+                     makeSource: { _ in FileSource(url: long, speed: 0) })
+    func rss() -> Double {
+        var info = mach_task_basic_info(); var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count) } }
+        return kr == KERN_SUCCESS ? Double(info.resident_size) / 1_048_576 : -1
+    }
+    let started = ContinuousClock.now
+    let m0 = rss()
+    await r.start(course: "30分钟")
+    var peak = m0
+    while r.phase == .recording { peak = max(peak, rss()); try? await Task.sleep(for: .milliseconds(200)) }
+    _ = await waitUntil(120) { r.phase == .finished }
+    let dir = r.deliveredDir
+    let sessionDir = (try? FileManager.default.contentsOfDirectory(at: local, includingPropertiesForKeys: nil))?.first
+    let caf = sessionDir.map { audioSeconds($0.appendingPathComponent("audio.caf")) } ?? -1
+    print("  墙钟 \(started.duration(to: .now))；音频 \(Int(caf)) 秒;内存起始 \(Int(m0)) MB,峰值 \(Int(peak)) MB")
+    await check("落盘时长≈30 分钟", abs(caf - 1800) < 2, "\(caf)")
+    let m4a = dir.flatMap { try? FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil).first { $0.pathExtension == "m4a" } }
+    let m4aSecs = m4a == nil ? -1 : ((try? await AVURLAsset(url: m4a!).load(.duration).seconds) ?? -1)
+    await check("M4A 时长与落盘偏差 <1 秒", abs(m4aSecs - caf) < 1, "\(m4aSecs)")
+    await check("内存峰值增量 <400 MB(不随时长无限增长)", peak - m0 < 400, "\(peak - m0)")
+}
+
 /// 生成 24k 单声道测试音(非语音),用于不依赖识别的链路测试。
 func makeTone(_ url: URL, seconds: Double) {
     let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24000, channels: 1, interleaved: false)!
@@ -93,10 +145,21 @@ final class MockEngine: TranscriptionEngine, @unchecked Sendable {
     private var count = 0
     private var dead = false
     init(_ m: Mode) { mode = m }
-    var firstStart: Double? { lock.lock(); defer { lock.unlock() }; return fedStarts.first }
-    func modelState() async -> ModelState { .ready }
-    func installModel(progress: @escaping @Sendable (Double) -> Void) async throws {}
-    func start(callbacks: EngineCallbacks) async throws { lock.lock(); cb = callbacks; lock.unlock() }
+    var firstStart: Double? { lock.withLock { fedStarts.first } }
+    var model: ModelState = .ready
+    var failInstall = false
+    var modelQueryDelay: Duration?
+    func modelState() async -> ModelState {
+        let snapshot = model
+        if let modelQueryDelay { try? await Task.sleep(for: modelQueryDelay) }
+        return snapshot
+    }
+    func installModel(progress: @escaping @Sendable (Double) -> Void) async throws {
+        if failInstall { throw EngineError.modelMissing }
+        progress(0.5)
+        model = .ready
+    }
+    func start(callbacks: EngineCallbacks) async throws { lock.withLock { cb = callbacks } }
     func feed(_ buffer: AVAudioPCMBuffer, start: Double) {
         lock.lock()
         if dead { lock.unlock(); return }
@@ -119,11 +182,11 @@ final class MockEngine: TranscriptionEngine, @unchecked Sendable {
     }
     func finish() async -> Bool {
         if case .hangFinish = mode { try? await Task.sleep(for: .seconds(3600)); return true }
-        lock.lock(); let cb = self.cb; let s = lastEmitEnd; let e = fedSeconds; let d = dead; lock.unlock()
+        let (cb, s, e, d) = lock.withLock { (self.cb, lastEmitEnd, fedSeconds, dead) }
         if let cb, e > s + 0.01, !d { await cb.final(s, e, "尾@\(Int(s))") }
         return !d
     }
-    func cancel() async { lock.lock(); dead = true; lock.unlock() }
+    func cancel() async { lock.withLock { dead = true } }
 }
 
 @MainActor
@@ -160,7 +223,7 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--hang" {
         return r
     }
     await r.start(course: "强杀测试")
-    while await r.duration < 4 { try? await Task.sleep(for: .milliseconds(100)) }
+    while r.duration < 4 { try? await Task.sleep(for: .milliseconds(100)) }
     print("READY"); fflush(stdout)
     try? await Task.sleep(for: .seconds(600))
     exit(0)
@@ -551,20 +614,20 @@ do {
     _ = await MainActor.run { r }.duration
     _ = await waitUntil(2.2) { r.duration >= 2 }
     await r.pause()
-    let d1 = await r.duration
+    let d1 = r.duration
     try? await Task.sleep(for: .seconds(1.5))
-    let d2 = await r.duration
+    let d2 = r.duration
     await check("暂停期间时长不增加", abs(d2 - d1) < 0.05, "\(d1) → \(d2)")
     await r.resume()
     _ = await waitUntil(1.5) { r.duration > d2 + 1 }
     await r.stop()
-    let dir = await r.deliveredDir
-    let saveState = await r.save
+    let dir = r.deliveredDir
+    let saveState = r.save
     await check("已保存到目标目录", dir != nil && saveState == .saved(dir!.path))
     let sessionDir = (try? FileManager.default.contentsOfDirectory(at: local, includingPropertiesForKeys: nil))?.first
     let caf = sessionDir!.appendingPathComponent("audio.caf")
     let cafSecs = audioSeconds(caf)
-    let dur = await r.duration
+    let dur = r.duration
     await check("界面时长=落盘音频时长", abs(cafSecs - dur) < 0.05, "\(cafSecs) vs \(dur)")
     await check("音频长度≈采集时长而非含暂停", cafSecs < 5.5 && cafSecs > 3, "\(cafSecs)")
     let m4a = try? FileManager.default.contentsOfDirectory(at: dir!, includingPropertiesForKeys: nil).first { $0.pathExtension == "m4a" }
@@ -585,12 +648,12 @@ do {
     let (r, local, _) = await MainActor.run { makeRecorder("fail", tone: tone, engines: [{ first }, { second }]) }
     await r.start(course: "")
     _ = await waitUntil(8) { r.duration > 7 }
-    let dBefore = await r.duration
+    let dBefore = r.duration
     await check("识别故障后录音仍在继续", dBefore > 5)
     await r.stop()
     let sessionDir = (try? FileManager.default.contentsOfDirectory(at: local, includingPropertiesForKeys: nil))!.first!
     let cafSecs = audioSeconds(sessionDir.appendingPathComponent("audio.caf"))
-    let durNow = await r.duration
+    let durNow = r.duration
     await check("音频完整保存", cafSecs > dBefore - 0.2 && abs(cafSecs - durNow) < 0.05, "\(cafSecs)")
     await check("恢复引擎从中断位置补喂", (second.firstStart ?? 99) <= first.fedSeconds + 0.1, "second.first=\(second.firstStart ?? -1) first.fed=\(first.fedSeconds)")
     let events = SessionStore.loadEvents(dir: sessionDir).events
@@ -598,7 +661,7 @@ do {
     let ok = zip(texts, texts.dropFirst()).allSatisfy { $1.start >= $0.end - 0.001 }
     await check("事件时间不重叠(无重复文字)", ok, "\(texts.map { ($0.start, $0.end) })")
     await check("无 gap(补喂覆盖了故障区间)", events.allSatisfy { $0.kind == .text })
-    await check("最终状态完成", (await r.finalStatus) == .completed)
+    await check("最终状态完成", r.finalStatus == .completed)
 }
 do {
     // 全部引擎都失败:状态转为异常,音频不丢,Markdown 如实标注
@@ -607,11 +670,11 @@ do {
     _ = await waitUntil(25) { r.phase == .finished }  // 12 秒音频播完后自动结束
     let sessionDir = (try? FileManager.default.contentsOfDirectory(at: local, includingPropertiesForKeys: nil))!.first!
     await check("重试耗尽后音频仍完整", audioSeconds(sessionDir.appendingPathComponent("audio.caf")) > 11, "\(audioSeconds(sessionDir.appendingPathComponent("audio.caf")))")
-    let st = await r.finalStatus
+    let st = r.finalStatus
     await check("状态为部分完成/失败而非完成", st == .partial || st == .failed, "\(String(describing: st))")
     let md = (try? String(contentsOf: sessionDir.appendingPathComponent(sessionDir.lastPathComponent + ".md"), encoding: .utf8)) ?? ""
     await check("Markdown 标注转写不完整", md.contains("转写不完整") && !md.contains("转写状态:完成"))
-    await check("仍然交付音频与文本", (await r.deliveredDir) != nil)
+    await check("仍然交付音频与文本", r.deliveredDir != nil)
 }
 
 section("结束时识别卡死")
@@ -622,8 +685,8 @@ do {
     let t0 = Date()
     await r.stop()
     let el = Date().timeIntervalSince(t0)
-    await check("超时后仍完成保存", (await r.deliveredDir) != nil && el < 8, "用时 \(el)s")
-    await check("状态为部分完成", (await r.finalStatus) == .partial)
+    await check("超时后仍完成保存", r.deliveredDir != nil && el < 8, "用时 \(el)s")
+    await check("状态为部分完成", r.finalStatus == .partial)
 }
 
 section("交付失败与重试")
@@ -638,14 +701,14 @@ do {
     _ = await waitUntil(3) { r.duration > 2 }
     await r.stop()
     var pending = false
-    if case .pending(let p, _) = await r.save { pending = p.hasPrefix(local.path) }
+    if case .pending(let p, _) = r.save { pending = p.hasPrefix(local.path) }
     await check("交付失败时显示本地路径并保留文件", pending)
     let sessionDir = (try? FileManager.default.contentsOfDirectory(at: local, includingPropertiesForKeys: nil))!.first!
     await check("本地保留 M4A 与 Markdown", FileManager.default.fileExists(atPath: sessionDir.appendingPathComponent(sessionDir.lastPathComponent + ".m4a").path)
           && FileManager.default.fileExists(atPath: sessionDir.appendingPathComponent(sessionDir.lastPathComponent + ".md").path))
     await check("会话状态为待保存", SessionStore.readInfo(dir: sessionDir)?.state == .pendingSave)
     await r.retrySave()
-    let retried = await r.deliveredDir
+    let retried = r.deliveredDir
     await check("重试后交付到同一目标目录", retried != nil && ProjectLibrary.contains(dest, retried!))
     await check("会话状态为已保存", SessionStore.readInfo(dir: sessionDir)?.state == .saved)
 }
@@ -675,7 +738,7 @@ do {
         await check("强杀后 CAF 仍可读取", audioSeconds(dir.appendingPathComponent("audio.caf")) > 2, "\(audioSeconds(dir.appendingPathComponent("audio.caf")))")
         let r = await MainActor.run { Recorder(saveRoot: dest, localRoot: local, makeEngine: { MockEngine(.normal) }, makeSource: { _ in FileSource(url: tone) }) }
         await r.recover(dir: dir)
-        let out = await r.deliveredDir
+        let out = r.deliveredDir
         await check("恢复后生成并交付 M4A+Markdown", out != nil
               && (try? FileManager.default.contentsOfDirectory(atPath: out!.path).contains { $0.hasSuffix(".m4a") }) == true
               && (try? FileManager.default.contentsOfDirectory(atPath: out!.path).contains { $0.hasSuffix(".md") }) == true)
@@ -688,11 +751,13 @@ do {
 // MARK: 5 真实识别(合成中文语音)
 if CommandLine.arguments.contains("--real") {
     section("真实 SpeechTranscriber(合成中文语音,非课堂录音)")
-    let say = tmp.appendingPathComponent("say.aiff")
-    let text = "同学们好,今天我们讲计算机网络的第一章。计算机网络是互联的、自治的计算机的集合。我们先来看分组交换和电路交换的区别。分组交换把数据分成一个个小的分组,每个分组独立地在网络中传输。这样可以提高线路的利用率。接下来介绍网络的时延,包括发送时延、传播时延、处理时延和排队时延。"
-    let sp = Process(); sp.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-    sp.arguments = ["-v", "Eddy (中文(中国大陆))", "-o", say.path, text]
-    try! sp.run(); sp.waitUntilExit()
+    let say: URL
+    do {
+        say = try networkLectureAudio(generatedAt: tmp.appendingPathComponent("say.aiff"))
+    } catch {
+        await check("合成讲稿音频可用", false, "\(error.localizedDescription)")
+        exit(1)
+    }
     let total = audioSeconds(say)
     print("  合成音频时长 \(String(format: "%.1f", total)) 秒")
     let local = fresh("real-local"), dest = fresh("real-dest")
@@ -703,8 +768,8 @@ if CommandLine.arguments.contains("--real") {
     // 录音进行中(尚未结束)是否已出现文字
     var firstText: Double?
     let t0 = Date()
-    while await r.phase == .recording, Date().timeIntervalSince(t0) < total + 20 {
-        let any = await !r.segments.isEmpty || !r.volatileText.isEmpty
+    while r.phase == .recording, Date().timeIntervalSince(t0) < total + 20 {
+        let any = !r.segments.isEmpty || !r.volatileText.isEmpty
         if any, firstText == nil { firstText = Date().timeIntervalSince(t0) }
         try? await Task.sleep(for: .milliseconds(100))
     }
@@ -712,21 +777,21 @@ if CommandLine.arguments.contains("--real") {
     _ = await waitUntil(60) { r.phase == .finished }
     print("  首次出现文字:\(firstText.map { String(format: "%.1f 秒", $0) } ?? "无")(音频共 \(String(format: "%.1f", total)) 秒)")
     await check("录音进行中就出现文字(非结束后批量)", (firstText ?? 999) < total - 3)
-    let segs = await r.segments
+    let segs = r.segments
     let joined = segs.map(\.text).joined()
     print("  识别结果:\(joined)")
     await check("识别出中文内容", joined.contains("计算机网络") && joined.contains("分组"))
     await check("句尾未丢失(最后一个词“排队”及其后文字在)", joined.contains("排队"))
     print("  注:合成语音里“时延”被同音误识为“食盐”,属识别准确率,不影响链路验证")
-    await check("状态为完成", (await r.finalStatus) == .completed, "\(String(describing: await r.finalStatus))")
+    await check("状态为完成", r.finalStatus == .completed, "\(String(describing: r.finalStatus))")
     await check("时间戳在音频时长内且递增", segs.allSatisfy { $0.start <= total + 1 } && zip(segs, segs.dropFirst()).allSatisfy { $1.start >= $0.start })
-    if let dir = await r.deliveredDir {
+    if let dir = r.deliveredDir {
         print("  交付目录:\(dir.path)")
         let md = (try? String(contentsOf: dir.appendingPathComponent(dir.lastPathComponent + ".md"), encoding: .utf8)) ?? ""
         print(md)
     }
     // 从已保存录音重新转写
-    if let dir = await r.deliveredDir, let m4a = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))?.first(where: { $0.pathExtension == "m4a" }) {
+    if let dir = r.deliveredDir, let m4a = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))?.first(where: { $0.pathExtension == "m4a" }) {
         do {
             let asm = try await Retranscriber.run(audio: m4a)
             let out = try Retranscriber.writeMarkdown(audio: m4a, assembler: asm, duration: audioSeconds(m4a))
@@ -771,33 +836,7 @@ if !skipCorrection, CommandLine.arguments.contains("--magpie") {
 }
 
 if CommandLine.arguments.contains("--long") {
-    section("30 分钟合成音频(模拟引擎):落盘、时长、内存")
-    let long = tmp.appendingPathComponent("long.caf")
-    makeTone(long, seconds: 1800)
-    let (r, local, _) = await MainActor.run {
-        let local = fresh("long-local"), dest = fresh("long-dest")
-        let r = Recorder(saveRoot: dest, localRoot: local, makeEngine: { MockEngine(.normal) }, makeSource: { _ in FileSource(url: long, speed: 0) })
-        return (r, local, dest)
-    }
-    func rss() -> Double {
-        var info = mach_task_basic_info(); var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
-        let kr = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count) } }
-        return kr == KERN_SUCCESS ? Double(info.resident_size) / 1_048_576 : -1
-    }
-    let m0 = rss()
-    await r.start(course: "30分钟")
-    var peak = m0
-    while await r.phase == .recording { peak = max(peak, rss()); try? await Task.sleep(for: .milliseconds(200)) }
-    _ = await waitUntil(120) { r.phase == .finished }
-    let dir = await r.deliveredDir
-    let sessionDir = (try? FileManager.default.contentsOfDirectory(at: local, includingPropertiesForKeys: nil))?.first
-    let caf = audioSeconds(sessionDir!.appendingPathComponent("audio.caf"))
-    print("  音频 \(Int(caf)) 秒;内存起始 \(Int(m0)) MB,峰值 \(Int(peak)) MB")
-    await check("落盘时长≈30 分钟", abs(caf - 1800) < 2, "\(caf)")
-    let m4a = dir.flatMap { try? FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil).first { $0.pathExtension == "m4a" } }
-    let m4aSecs = m4a == nil ? -1 : ((try? await AVURLAsset(url: m4a!).load(.duration).seconds) ?? -1)
-    await check("M4A 时长与落盘偏差 <1 秒", abs(m4aSecs - caf) < 1, "\(m4aSecs)")
-    await check("内存峰值增量 <400 MB(不随时长无限增长)", peak - m0 < 400, "\(peak - m0)")
+    await longRecordingCheck()
 }
 
 if CommandLine.arguments.contains("--real5") {
@@ -814,8 +853,8 @@ if CommandLine.arguments.contains("--real5") {
     }
     await r.start(course: "")
     var lastCount = 0; var maxStall = 0.0; var lastChange = Date()
-    while await r.phase == .recording {
-        let c = await r.segments.count + (await r.segments.last?.text.count ?? 0)
+    while r.phase == .recording {
+        let c = r.segments.count + (r.segments.last?.text.count ?? 0)
         if c != lastCount { lastCount = c; maxStall = max(maxStall, Date().timeIntervalSince(lastChange)); lastChange = Date() }
         try? await Task.sleep(for: .milliseconds(250))
     }
@@ -823,9 +862,9 @@ if CommandLine.arguments.contains("--real5") {
     await r.stop()
     _ = await waitUntil(90) { r.phase == .finished }
     print("  结束收尾用时 \(String(format: "%.1f", Date().timeIntervalSince(t0))) 秒;录音中最长无新增文字间隔 \(String(format: "%.1f", maxStall)) 秒")
-    let joined = await r.segments.map(\.text).joined()
+    let joined = r.segments.map(\.text).joined()
     await check("5 分钟内持续出文字", joined.count > 600, "\(joined.count) 字")
-    await check("状态为完成", (await r.finalStatus) == .completed)
+    await check("状态为完成", r.finalStatus == .completed)
     await check("收尾耗时 <20 秒", Date().timeIntervalSince(t0) < 20)
 }
 
@@ -835,6 +874,7 @@ await finishAndReplayRegressionChecks()
 await saveRootSnapshotChecks()
 await inputSwitchRegressionChecks()
 await libraryRegressionChecks()
+await reviewRegressionChecks(includeRecognition: CommandLine.arguments.contains("--real"))
 
 print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
 exit(failures == 0 ? 0 : 1)

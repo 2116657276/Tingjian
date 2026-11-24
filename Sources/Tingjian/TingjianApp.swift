@@ -44,16 +44,16 @@ struct TingjianApp: App {
                 Divider()
                 Button("重命名所选项…") { AppModel.shared.requestRenameSelection() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
-                    .disabled(AppModel.shared.selection.url == nil)
+                    .disabled(!AppModel.shared.canModifyLibrarySelection || AppModel.shared.recorder.isActive)
                 Button("移动所选项…") {
                     if let url = AppModel.shared.selection.url {
                         AppModel.shared.requestMove(url)
                     }
                 }
-                .disabled(AppModel.shared.selection.url == nil)
+                .disabled(!AppModel.shared.canModifyLibrarySelection || AppModel.shared.recorder.isActive)
                 Button("移入废纸篓…") { AppModel.shared.requestTrashSelection() }
                     .keyboardShortcut(.delete, modifiers: .command)
-                    .disabled(AppModel.shared.selection.url == nil || AppModel.shared.recorder.isActive)
+                    .disabled(!AppModel.shared.canModifyLibrarySelection || AppModel.shared.recorder.isActive)
                 Button("刷新项目列表") {
                     Task { await AppModel.shared.reloadLibrary() }
                 }
@@ -129,7 +129,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             await rec.stop()
             isSavingBeforeTermination = false
-            NSApp.reply(toApplicationShouldTerminate: true)
+            if case .saved = rec.save {
+                NSApp.reply(toApplicationShouldTerminate: true)
+            } else {
+                NSApp.reply(toApplicationShouldTerminate: false)
+                restoreMainWindow()
+            }
         }
         return .terminateLater
     }

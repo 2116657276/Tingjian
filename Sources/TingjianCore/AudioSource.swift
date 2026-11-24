@@ -70,7 +70,8 @@ public enum AudioError: Error, LocalizedError {
 }
 
 /// 按 uniqueID 固定输入的设备麦克风。只有 start() 被调用后才采集。
-public final class MicrophoneSource: NSObject, AudioSource, AVCaptureAudioDataOutputSampleBufferDelegate {
+/// 并发安全约束：会话配置/启停串行于 `controlQueue`，音频样本与转换器串行于 `sampleQueue`，`gate` 由 `lock` 保护。
+public final class MicrophoneSource: NSObject, AudioSource, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     public var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
     public var onInterruption: (@Sendable (String) -> Void)?
     public var onEnd: (@Sendable () -> Void)?
@@ -148,8 +149,8 @@ public final class MicrophoneSource: NSObject, AudioSource, AVCaptureAudioDataOu
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             controlQueue.async {
                 if self.session.isRunning { self.session.stopRunning() }
-                // 排空已进入的 sample 回调,返回后不会再投递缓冲区。
-                self.sampleQueue.sync {}
+                // 暂停也是输入设备切换的边界，先投递旧设备的尾帧。
+                self.sampleQueue.sync { _ = self.flushConverter() }
                 cont.resume()
             }
         }
@@ -160,7 +161,7 @@ public final class MicrophoneSource: NSObject, AudioSource, AVCaptureAudioDataOu
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             controlQueue.async {
                 if self.session.isRunning { self.session.stopRunning() }
-                self.sampleQueue.sync {}
+                self.sampleQueue.sync { _ = self.flushConverter() }
                 self.teardownLocked()
                 cont.resume()
             }
@@ -172,6 +173,7 @@ public final class MicrophoneSource: NSObject, AudioSource, AVCaptureAudioDataOu
     private func configureLocked() throws -> AVAudioFormat {
         setGate(false)
         if session.isRunning { session.stopRunning() }
+        sampleQueue.sync { _ = flushConverter() }
         teardownLocked()
 
         let uid: String
@@ -210,6 +212,7 @@ public final class MicrophoneSource: NSObject, AudioSource, AVCaptureAudioDataOu
         output.setSampleBufferDelegate(self, queue: sampleQueue)
         if session.canAddOutput(output) { session.addOutput(output) }
         else {
+            session.removeInput(input)
             session.commitConfiguration()
             throw AudioError.captureFailed("无法添加音频输出")
         }
@@ -223,15 +226,13 @@ public final class MicrophoneSource: NSObject, AudioSource, AVCaptureAudioDataOu
     }
 
     private func teardownLocked() {
-        if configured {
+        if configured || !session.inputs.isEmpty || !session.outputs.isEmpty {
             session.beginConfiguration()
             for input in session.inputs { session.removeInput(input) }
             for output in session.outputs { session.removeOutput(output) }
             session.commitConfiguration()
         }
         configured = false
-        converter = nil
-        converterInput = nil
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         observers = []
     }
@@ -249,7 +250,7 @@ public final class MicrophoneSource: NSObject, AudioSource, AVCaptureAudioDataOu
 
     private func interrupt(_ message: String) {
         setGate(false)
-        if configured { controlQueue.async { if self.session.isRunning { self.session.stopRunning() } } }
+        controlQueue.async { if self.session.isRunning { self.session.stopRunning() } }
         onInterruption?(message)
     }
 
@@ -262,19 +263,15 @@ public final class MicrophoneSource: NSObject, AudioSource, AVCaptureAudioDataOu
     public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         lock.lock(); let open = gate; lock.unlock()
         guard open else { return }
-        guard let buffer = Self.makeBuffer(sampleBuffer) else { return }
-        let ready: AVAudioPCMBuffer
+        guard let buffer = Self.makeBuffer(sampleBuffer), buffer.frameLength > 0 else { return }
+        if converterInput != buffer.format, !flushConverter() { return }
         if buffer.format.sampleRate == targetFormat.sampleRate,
            buffer.format.channelCount == 1,
            buffer.format.commonFormat == .pcmFormatFloat32 {
-            ready = buffer
-        } else if let converted = convert(buffer) {
-            ready = converted
+            onBuffer?(buffer)
         } else {
-            return
+            convert(buffer)
         }
-        guard ready.frameLength > 0 else { return }
-        onBuffer?(ready)
     }
 
     /// 在 sampleBuffer 有效期内以无拷贝包装交出样本,由 AudioPipeline 同步拷贝。
@@ -309,33 +306,56 @@ public final class MicrophoneSource: NSObject, AudioSource, AVCaptureAudioDataOu
             raw.deallocate()
             return nil
         }
-        pcm.frameLength = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        let sampleCount = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard sampleCount > 0, sampleCount <= Int(pcm.frameCapacity) else { return nil }
+        pcm.frameLength = AVAudioFrameCount(sampleCount)
         return pcm
     }
 
-    private func convert(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        if converter == nil || converterInput != buffer.format {
-            converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+    @discardableResult
+    private func flushConverter() -> Bool {
+        guard let converter else { return true }
+        defer { self.converter = nil; converterInput = nil }
+        do {
+            try drainPCM(converter) { onBuffer?($0) }
+            return true
+        } catch {
+            interrupt("音频转换收尾失败:\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func convert(_ buffer: AVAudioPCMBuffer) {
+        if converter == nil {
+            let next = AVAudioConverter(from: buffer.format, to: targetFormat)
+            next?.sampleRateConverterQuality = AVAudioQuality.high.rawValue
+            converter = next
             converterInput = buffer.format
         }
         guard let converter else {
             interrupt("音频格式不支持:\(buffer.format)")
-            return nil
+            return
         }
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
-        guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return nil }
+        let capacity = max(AVAudioFrameCount(ceil(Double(buffer.frameLength) * ratio)) + 1024, 1024)
         var supplied = false
-        var error: NSError?
-        converter.convert(to: out, error: &error) { _, status in
-            if supplied { status.pointee = .noDataNow; return nil }
-            supplied = true; status.pointee = .haveData; return buffer
+        while true {
+            guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
+                interrupt("无法分配采集重采样缓冲")
+                return
+            }
+            var error: NSError?
+            let status = converter.convert(to: out, error: &error) { _, status in
+                if supplied { status.pointee = .noDataNow; return nil }
+                supplied = true; status.pointee = .haveData; return buffer
+            }
+            if error != nil || status == .error {
+                interrupt("音频转换失败:\(error?.localizedDescription ?? "重采样返回错误状态")")
+                return
+            }
+            if out.frameLength > 0 { onBuffer?(out) }
+            if status != .haveData || out.frameLength < capacity { return }
         }
-        if let error {
-            interrupt("音频转换失败:\(error.localizedDescription)")
-            return nil
-        }
-        return out.frameLength > 0 ? out : nil
     }
 }
 
@@ -346,6 +366,7 @@ public final class FileSource: AudioSource, @unchecked Sendable {
     public var onEnd: (@Sendable () -> Void)?
     public var activeDeviceUID: String? { nil }
     public var activeDeviceName: String? { nil }
+    @_spi(Testing) public var observeBuffer: (@Sendable (Int, Double) -> Void)?
 
     private let url: URL
     private let speed: Double
@@ -362,45 +383,114 @@ public final class FileSource: AudioSource, @unchecked Sendable {
 
     public func prepare() async throws -> AVAudioFormat {
         let f = try AVAudioFile(forReading: url)
-        lock.lock(); file = f; lock.unlock()
+        guard f.length > 0 else { throw AudioError.captureFailed("合成音频无采样") }
+        let sampleRate = f.processingFormat.sampleRate
+        guard sampleRate.isFinite, sampleRate > 0 else {
+            throw AudioError.captureFailed("合成音频采样率无效")
+        }
+        lock.withLock { file = f }
         return f.processingFormat
     }
 
     public func start() async throws {
-        lock.lock()
-        guard let file = self.file else { lock.unlock(); throw AudioError.noInput }
-        running = true
-        let alreadyRunning = task != nil
-        lock.unlock()
-        if alreadyRunning { return }
-        let chunk: AVAudioFrameCount = 4096
-        let rate = file.processingFormat.sampleRate
-        task = Task.detached { [weak self] in
-            while let self, !Task.isCancelled {
-                self.lock.lock(); let run = self.running; let stop = self.stopped; self.lock.unlock()
-                if stop { return }
-                if !run { try? await Task.sleep(for: .milliseconds(20)); continue }
-                guard let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: chunk) else { return }
-                do { try file.read(into: buf, frameCount: chunk) } catch { self.onEnd?(); return }
-                if buf.frameLength == 0 { self.onEnd?(); return }
-                self.onBuffer?(buf)
-                if self.speed > 0 {
-                    try? await Task.sleep(for: .seconds(Double(buf.frameLength) / rate / self.speed))
-                } else {
-                    await Task.yield()
+        try lock.withLock {
+            guard let file, !stopped else { throw AudioError.noInput }
+            running = true
+            guard task == nil else { return }
+            let totalFrames = file.length
+            task = Task.detached { [weak self] in
+                var deadline = ContinuousClock.now
+                while let self, !Task.isCancelled {
+                    do {
+                        switch try self.readNext(from: file, totalFrames: totalFrames) {
+                        case .paused:
+                            try await Task.sleep(for: .milliseconds(20))
+                            deadline = .now
+                        case .end:
+                            self.finishReading()
+                            self.onEnd?()
+                            return
+                        case .delivered(let duration):
+                            if self.speed > 0 {
+                                deadline = deadline.advanced(by: .seconds(duration / self.speed))
+                                try await Task.sleep(until: deadline, clock: .continuous)
+                            } else {
+                                await Task.yield()
+                            }
+                        }
+                    } catch is CancellationError {
+                        return
+                    } catch {
+                        self.finishReading()
+                        self.onInterruption?(error.localizedDescription)
+                        return
+                    }
                 }
             }
+        }
+    }
+
+    private enum ReadResult { case paused, end, delivered(Double) }
+
+    private enum NextChunk {
+        case paused
+        case end
+        case buffer(
+            AVAudioPCMBuffer,
+            rate: Double,
+            observe: (@Sendable (Int, Double) -> Void)?,
+            deliver: (@Sendable (AVAudioPCMBuffer) -> Void)?
+        )
+    }
+
+    private func finishReading() {
+        lock.withLock { task = nil; running = false }
+    }
+
+    private func readNext(from file: AVAudioFile, totalFrames: AVAudioFramePosition) throws -> ReadResult {
+        let next: NextChunk = try lock.withLock {
+            if stopped { throw CancellationError() }
+            if !running { return .paused }
+            let remaining = totalFrames - file.framePosition
+            if remaining <= 0 { return .end }
+            let chunk = AVAudioFrameCount(min(4096, remaining))
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: chunk) else {
+                throw AudioError.captureFailed("无法分配合成音频缓冲")
+            }
+            try file.read(into: buffer, frameCount: chunk)
+            if buffer.frameLength == 0 { return .end }
+            let rate = buffer.format.sampleRate
+            guard rate.isFinite, rate > 0 else {
+                throw AudioError.captureFailed("合成音频采样率无效")
+            }
+            return .buffer(buffer, rate: rate, observe: observeBuffer, deliver: onBuffer)
+        }
+        switch next {
+        case .paused:
+            return .paused
+        case .end:
+            return .end
+        case .buffer(let buffer, let rate, let observe, let deliver):
+            observe?(Int(buffer.frameLength), rate)
+            deliver?(buffer)
+            return .delivered(Double(buffer.frameLength) / rate)
         }
     }
 
     public func restart() async throws { try await start() }
 
     public func pause() async {
-        lock.lock(); running = false; lock.unlock()
+        lock.withLock { running = false }
     }
 
     public func stop() async {
-        lock.lock(); stopped = true; running = false; lock.unlock()
-        task?.cancel(); task = nil
+        let pending = lock.withLock {
+            stopped = true; running = false
+            let pending = task
+            task = nil
+            return pending
+        }
+        pending?.cancel()
+        await pending?.value
     }
 }

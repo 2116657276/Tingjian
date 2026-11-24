@@ -112,9 +112,16 @@ enum AppAppearance: String, CaseIterable, Identifiable {
 final class AppModel: ObservableObject {
     static let shared = AppModel()
 
-    /// 测试环境变量:TINGJIAN_TEST_ROOT 隔离目录与偏好;TINGJIAN_TEST_AUDIO 用合成音频代替麦克风。
-    static let testRoot = ProcessInfo.processInfo.environment["TINGJIAN_TEST_ROOT"].map { URL(fileURLWithPath: $0, isDirectory: true) }
-    static let testAudio = ProcessInfo.processInfo.environment["TINGJIAN_TEST_AUDIO"].map { URL(fileURLWithPath: $0) }
+    /// 测试环境变量:TINGJIAN_TEST_ROOT 隔离目录与偏好;TINGJIAN_TEST_AUDIO 仅在同时设置 TINGJIAN_TEST_ROOT 时生效,避免误写入正式资料库。
+    static let testRoot: URL? = {
+        guard let value = ProcessInfo.processInfo.environment["TINGJIAN_TEST_ROOT"], !value.isEmpty else { return nil }
+        return URL(fileURLWithPath: value, isDirectory: true)
+    }()
+    static let testAudio: URL? = {
+        guard testRoot != nil,
+              let value = ProcessInfo.processInfo.environment["TINGJIAN_TEST_AUDIO"], !value.isEmpty else { return nil }
+        return URL(fileURLWithPath: value)
+    }()
     static let defaults: UserDefaults = {
         guard let root = testRoot else { return .standard }
         let suite = Data(root.standardizedFileURL.path.utf8).base64EncodedString()
@@ -128,6 +135,7 @@ final class AppModel: ObservableObject {
             documentRead?.cancel()
             for task in directoryLoads.values { task.cancel() }
             directoryLoads.removeAll()
+            pendingDirectoryReloads.removeAll()
             Self.defaults.set(saveRoot.path, forKey: "saveRoot")
             library = ProjectLibrary(root: saveRoot)
             childrenByDirectory = [:]
@@ -192,7 +200,6 @@ final class AppModel: ObservableObject {
         didSet {
             if let audioInputUID { Self.defaults.set(audioInputUID, forKey: "audioInputUID") }
             else { Self.defaults.removeObject(forKey: "audioInputUID") }
-            recorder.preferredInputUID = audioInputUID
         }
     }
     @Published var inputDevices: [AudioInputDevice] = []
@@ -210,6 +217,7 @@ final class AppModel: ObservableObject {
     @Published var showUnfinished = false
     @Published var trashed: Int?
     @Published var retranscribe: String?
+    @Published private(set) var isRetranscribing = false
 
     @Published private(set) var selection: WorkspaceSelection
     @Published private(set) var drafts: [RecordingDraft] {
@@ -257,7 +265,8 @@ final class AppModel: ObservableObject {
     private var correctionToken = UUID()
     private var documentGeneration = 0
     private var documentRead: Task<OpenDocument?, Error>?
-    private var directoryLoads: [URL: Task<[LibraryEntry], Error>] = [:]
+    private var directoryLoads: [URL: Task<Void, Never>] = [:]
+    private var pendingDirectoryReloads: Set<URL> = []
 
     private var documentsByURL: [URL: OpenDocument] = [:]
     private var audioPositions: [URL: Double] = [:]
@@ -297,7 +306,6 @@ final class AppModel: ObservableObject {
         } else {
             recorder = Recorder(saveRoot: root, localRoot: local)
         }
-        recorder.preferredInputUID = audioInputUID
         reconcileDrafts()
         if storedDrafts == nil, let data = try? JSONEncoder().encode(drafts) {
             d.set(data, forKey: "recordingDrafts")
@@ -342,38 +350,81 @@ final class AppModel: ObservableObject {
         inputDevices = AudioInputCatalog.devices()
     }
 
-    /// 录音中切换先尝试真实切换,成功才提交偏好;失败恢复原选择。
-    func selectInput(_ uid: String?) {
-        if recorder.phase == .recording || recorder.phase == .paused {
-            let resolved = uid ?? AudioInputCatalog.defaultUID
-            guard let resolved else { libraryNotice = "没有可用的输入设备"; return }
-            Task {
-                do {
-                    try await recorder.switchInput(to: resolved)
-                    audioInputUID = uid
-                    refreshInputDevices()
-                } catch {
-                    libraryNotice = "切换输入失败:\(error.localizedDescription)"
-                    refreshInputDevices()
-                }
-            }
-        } else {
-            audioInputUID = uid
-            recorder.preferredInputUID = uid
+    private enum NextInput { case configuredDefault, systemDefault, device(String) }
+    @Published private var nextInput: NextInput = .configuredDefault
+    @Published private(set) var inputSwitchError: String?
+
+    private var nextInputUID: String? {
+        switch nextInput {
+        case .configuredDefault: return audioInputUID
+        case .systemDefault: return nil
+        case .device(let uid): return uid
         }
     }
 
-    var activeInputDescription: String {
-        if let name = recorder.activeInputName { return name }
-        if let uid = audioInputUID {
-            return inputDevices.first { $0.id == uid }?.name ?? "设备不可用"
+    var canSelectQuickInput: Bool {
+        switch recorder.phase {
+        case .recording, .paused: return !recorder.isChangingInput
+        case .idle, .finished: return !recordingOperation
+        case .starting, .finalizing: return false
         }
-        return "系统默认"
+    }
+
+    var isUsingConfiguredInput: Bool {
+        if case .configuredDefault = nextInput { return true }
+        return false
+    }
+
+    var quickInputUID: String? {
+        recorder.isActive ? recorder.activeInputUID : nextInputUID
+    }
+
+    func useConfiguredInput() {
+        guard canSelectQuickInput, !recorder.isActive else { return }
+        nextInput = .configuredDefault
+        inputSwitchError = nil
+    }
+
+    func selectQuickInput(_ uid: String?) {
+        guard canSelectQuickInput else { return }
+        inputSwitchError = nil
+        if recorder.phase == .recording || recorder.phase == .paused {
+            guard let resolved = uid ?? AudioInputCatalog.defaultUID else {
+                inputSwitchError = "没有可用的输入设备"
+                return
+            }
+            Task {
+                do { try await recorder.switchInput(to: resolved) }
+                catch { inputSwitchError = "切换输入失败：\(error.localizedDescription)" }
+                refreshInputDevices()
+            }
+        } else {
+            nextInput = uid.map(NextInput.device) ?? .systemDefault
+        }
+    }
+
+    private func inputDescription(_ uid: String?) -> String {
+        guard let uid else { return "系统默认" }
+        return inputDevices.first { $0.id == uid }?.name ?? "设备不可用"
+    }
+
+    var defaultInputDescription: String { inputDescription(audioInputUID) }
+
+    var quickInputDescription: String {
+        if Self.testAudio != nil { return "合成音频" }
+        if recorder.isActive { return recorder.activeInputName ?? inputDescription(nextInputUID) }
+        let name = inputDescription(nextInputUID)
+        return isUsingConfiguredInput ? name : "下次：\(name)"
     }
 
     var savedInputUnavailable: Bool {
-        guard let audioInputUID else { return false }
-        return !inputDevices.contains { $0.id == audioInputUID }
+        guard let uid = audioInputUID else { return false }
+        return !inputDevices.contains { $0.id == uid }
+    }
+
+    var nextInputUnavailable: Bool {
+        guard Self.testAudio == nil, let uid = nextInputUID else { return false }
+        return !inputDevices.contains { $0.id == uid }
     }
 
     private func observeDevices() {
@@ -442,29 +493,44 @@ final class AppModel: ObservableObject {
     func loadChildren(_ directory: URL, force: Bool = false) async {
         let dir = directory.standardizedFileURL
         if !force, childrenByDirectory[dir] != nil { return }
-        if let existing = directoryLoads[dir] { _ = await existing.result; return }
+        if let existing = directoryLoads[dir] {
+            if force { pendingDirectoryReloads.insert(dir) }
+            await existing.value
+            return
+        }
         let source = library
-        let task = Task.detached {
-            try Task.checkCancellation()
-            return try await source.children(of: dir, classifyDirectories: false)
-        }
-        directoryLoads[dir] = task
-        let result = await task.result
-        guard source === library else { return }
-        directoryLoads[dir] = nil
-        switch result {
-        case .success(let entries):
-            if childrenByDirectory[dir] != entries { childrenByDirectory[dir] = entries }
-            directoryErrors[dir] = nil
-        case .failure(let error):
-            if case LibraryError.notFound = error, dir == saveRoot.standardizedFileURL {
-                childrenByDirectory[dir] = []
-                directoryErrors[dir] = nil
-            } else {
-                if case LibraryError.notFound = error { childrenByDirectory[dir] = nil }
-                directoryErrors[dir] = error.localizedDescription
+        let loadTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.library === source {
+                    self.directoryLoads[dir] = nil
+                    self.pendingDirectoryReloads.remove(dir)
+                }
             }
+            repeat {
+                self.pendingDirectoryReloads.remove(dir)
+                let result = await Task.detached {
+                    try Task.checkCancellation()
+                    return try await source.children(of: dir, classifyDirectories: false)
+                }.result
+                guard !Task.isCancelled, self.library === source else { return }
+                switch result {
+                case .success(let entries):
+                    if self.childrenByDirectory[dir] != entries { self.childrenByDirectory[dir] = entries }
+                    self.directoryErrors[dir] = nil
+                case .failure(let error):
+                    if case LibraryError.notFound = error, dir == self.saveRoot.standardizedFileURL {
+                        self.childrenByDirectory[dir] = []
+                        self.directoryErrors[dir] = nil
+                    } else {
+                        if case LibraryError.notFound = error { self.childrenByDirectory[dir] = nil }
+                        self.directoryErrors[dir] = error.localizedDescription
+                    }
+                }
+            } while !Task.isCancelled && self.pendingDirectoryReloads.contains(dir)
         }
+        directoryLoads[dir] = loadTask
+        await loadTask.value
     }
 
     func isRecordingDirectory(_ url: URL) -> Bool {
@@ -519,6 +585,7 @@ final class AppModel: ObservableObject {
         documentGeneration += 1
         documentRead?.cancel()
         audioError = nil
+        seekMessage = nil
         if let currentAudio = playback.currentURL?.standardizedFileURL {
             audioPositions[currentAudio] = playback.position
         }
@@ -907,12 +974,15 @@ final class AppModel: ObservableObject {
             return
         }
         let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        recorder.preferredInputUID = audioInputUID
+        recorder.preferredInputUID = nextInputUID
+        inputSwitchError = nil
         libraryNotice = nil
         recordingOperation = true
         activeDraftID = id
         Task {
-            await recorder.start(course: name, draftID: id, destination: destination, placement: draft.placement)
+            if await recorder.start(course: name, draftID: id, destination: destination, placement: draft.placement) {
+                nextInput = .configuredDefault
+            }
             recordingOperation = false
             if !recorder.isActive && !saveNeedsRetry { activeDraftID = nil }
         }
@@ -920,7 +990,7 @@ final class AppModel: ObservableObject {
 
     var canStartRecording: Bool {
         guard let id = selection.draftID else { return false }
-        return !recordingBusy && !isDraftLocked(id) && !savedInputUnavailable
+        return !recordingBusy && !isDraftLocked(id) && !nextInputUnavailable
     }
 
     func requestRename(_ url: URL) {
@@ -982,8 +1052,14 @@ final class AppModel: ObservableObject {
             }
             documentsByURL.removeAll()
             await loadChildren(renamed.deletingLastPathComponent(), force: true)
-            if expandedDirectories.contains(renamed.standardizedFileURL) {
-                await loadChildren(renamed, force: true)
+            let renamedDir = renamed.standardizedFileURL
+            var isRenamedDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: renamedDir.path, isDirectory: &isRenamedDirectory),
+               isRenamedDirectory.boolValue,
+               expandedDirectories.contains(renamedDir)
+                || childrenByDirectory[renamedDir] != nil
+                || currentDirectory.standardizedFileURL == renamedDir {
+                await loadChildren(renamedDir, force: true)
             }
             if generation == documentGeneration, let playing {
                 var mapped = remapURL(playing, from: url, to: renamed)
@@ -1021,28 +1097,31 @@ final class AppModel: ObservableObject {
         }
         Task {
             do {
-                let url = try await library.moveUnit(for: item)
+                let plan = try await library.movePlan(for: item)
                 guard !recorder.isActive else { return }
-                if let directory {
-                    guard url.deletingLastPathComponent().resolvingSymlinksInPath().path != directory.resolvingSymlinksInPath().path else {
+                guard let destination = directory ?? chooseMoveDestination(for: plan) else { return }
+                if directory != nil || !plan.recordings.isEmpty {
+                    guard plan.sources.first?.deletingLastPathComponent().resolvingSymlinksInPath()
+                            != destination.resolvingSymlinksInPath() else {
                         libraryNotice = "该项目已在此文件夹中。"
                         return
                     }
                     let alert = NSAlert()
-                    alert.messageText = "移动「" + url.lastPathComponent + "」？"
-                    alert.informativeText = "目标文件夹为「" + directory.lastPathComponent + "」。"
+                    alert.messageText = plan.recordings.isEmpty ? "移动「" + plan.item.lastPathComponent + "」？" : "移动这份录音？"
+                    let target = "目标文件夹为「" + destination.lastPathComponent + "」。"
+                    alert.informativeText = ([target] + plan.recordings).joined(separator: "\n")
                     alert.addButton(withTitle: "移动")
                     alert.addButton(withTitle: "取消")
-                    if alert.runModal() == .alertFirstButtonReturn { await moveEntry(url, into: directory) }
-                } else {
-                    chooseMoveDestination(for: url)
+                    guard alert.runModal() == .alertFirstButtonReturn else { return }
                 }
+                await moveEntry(plan, into: destination)
             } catch { libraryNotice = error.localizedDescription }
         }
     }
 
-    private func moveEntry(_ url: URL, into directory: URL) async {
-        guard !recorder.isActive, url.deletingLastPathComponent().standardizedFileURL != directory.standardizedFileURL else { return }
+    private func moveEntry(_ plan: LibraryMovePlan, into directory: URL) async {
+        guard !recorder.isActive, let source = plan.sources.first,
+              source.deletingLastPathComponent().resolvingSymlinksInPath() != directory.resolvingSymlinksInPath() else { return }
         documentGeneration += 1
         let generation = documentGeneration
         await syncProtection()
@@ -1050,17 +1129,25 @@ final class AppModel: ObservableObject {
         let position = playback.position
         playback.stop()
         do {
-            let moved = try await library.move(url, into: directory)
-            guard moved != url else { return }
-            remapPaths(from: url, to: moved)
+            let destinations = try await library.move(plan, into: directory)
+            let changes = Array(zip(plan.sources, destinations))
+            for (before, after) in changes { remapPaths(from: before, to: after) }
             documentsByURL.removeAll()
-            await loadChildren(url.deletingLastPathComponent(), force: true)
+            await loadChildren(source.deletingLastPathComponent(), force: true)
             await loadChildren(directory, force: true)
-            if expandedDirectories.contains(moved.standardizedFileURL) {
-                await loadChildren(moved, force: true)
+            for moved in destinations {
+                let movedDir = moved.standardizedFileURL
+                var isMovedDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: movedDir.path, isDirectory: &isMovedDirectory),
+                      isMovedDirectory.boolValue else { continue }
+                if expandedDirectories.contains(movedDir)
+                    || childrenByDirectory[movedDir] != nil
+                    || currentDirectory.standardizedFileURL == movedDir {
+                    await loadChildren(movedDir, force: true)
+                }
             }
             if generation == documentGeneration, let playing {
-                let mapped = remapURL(playing, from: url, to: moved)
+                let mapped = changes.reduce(playing) { remapURL($0, from: $1.0, to: $1.1) }
                 audioPositions[mapped.standardizedFileURL] = position
                 if FileManager.default.fileExists(atPath: mapped.path) {
                     try? await playback.load(mapped)
@@ -1082,21 +1169,22 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func chooseMoveDestination(for url: URL) {
+    private func chooseMoveDestination(for plan: LibraryMovePlan) -> URL? {
+        let url = plan.sources.first ?? plan.item
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = false
-        panel.directoryURL = url.deletingLastPathComponent()
-        panel.message = "为「" + url.lastPathComponent + "」选择目标文件夹"
+        panel.directoryURL = plan.recordings.isEmpty ? url.deletingLastPathComponent() : saveRoot
+        panel.message = plan.recordings.isEmpty ? "为「" + url.lastPathComponent + "」选择目标文件夹" : "为这份录音选择目标文件夹"
         panel.prompt = "移动到这里"
-        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        guard panel.runModal() == .OK, let destination = panel.url else { return nil }
         guard ProjectLibrary.contains(saveRoot, destination) else {
             libraryNotice = "只能移动到当前资料库内:\(saveRoot.path)"
-            return
+            return nil
         }
-        Task { await moveEntry(url, into: destination) }
+        return destination
     }
 
     private func syncProtection() async {
@@ -1301,15 +1389,24 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 返回 nil 表示已定位;否则返回不可定位的原因。
-    @discardableResult
-    func seek(toTimecode time: String) -> String? {
-        guard !recorder.isActive else { return "录音进行中不能从文稿播放音频" }
-        guard playback.currentURL != nil else { return "没有已加载的音频" }
-        guard let seconds = Self.parseTimecode(time) else { return "时间戳无法解析" }
-        guard playback.canSeek, seconds < playback.duration else { return "该时间点超出音频时长" }
+    func seek(toTimecode time: String) async {
+        let generation = documentGeneration
+        guard !recorder.isActive, let audio = openDocument?.linkedAudio,
+              let seconds = Self.parseTimecode(time) else { return }
+        if playback.currentURL?.standardizedFileURL != audio.standardizedFileURL {
+            await loadAudio(audio, generation: generation)
+        }
+        guard generation == documentGeneration, !recorder.isActive else { return }
+        guard playback.currentURL?.standardizedFileURL == audio.standardizedFileURL, playback.canSeek else {
+            seekMessage = audioError ?? "关联音频暂时无法播放"
+            return
+        }
+        guard seconds < playback.duration else {
+            seekMessage = "该时间点超出音频时长"
+            return
+        }
         playback.seek(to: seconds)
-        return nil
+        seekMessage = nil
     }
 
     static func parseTimecode(_ text: String) -> Double? {
@@ -1479,7 +1576,7 @@ final class AppModel: ObservableObject {
     // MARK: 课后纠正
 
     var llmConfigured: Bool {
-        gatewayEndpoint != nil && !llmModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && selectedModel?.supportsChat != false
+        gatewayEndpoint != nil && !llmModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && (selectedModel?.supportsChat ?? true)
     }
     var gatewayHost: String { URL(string: llmURL).map { ($0.host ?? "") + ($0.port.map { ":\($0)" } ?? "") } ?? llmURL }
@@ -1488,10 +1585,10 @@ final class AppModel: ObservableObject {
         correctionByDocument[document.standardizedFileURL] ?? .idle
     }
 
-    func correctionHelp(for document: URL) -> String {
+    var correctionHelp: String {
         let endpoint = llmURL.isEmpty ? "尚未配置的服务" : llmURL
         let name = selectedModel?.displayName ?? llmModel
-        return "仅把 \(document.lastPathComponent) 的转写文字发送到 \(endpoint),模型 \(name),推理强度 \(llmEffort)。不发送录音。"
+        return "会向 \(endpoint) 的 \(name) 模型发送转写文字、项目和录音目录名、文稿名及部分文稿开头信息。校正结果与上下文摘要会缓存在本机。"
     }
 
     func correctionWasAttempted(for document: URL) -> Bool {
@@ -1504,7 +1601,11 @@ final class AppModel: ObservableObject {
     func startCorrection(document: URL) {
         let url = document.standardizedFileURL
         guard !correctionRunning else { return }
-        guard llmEnabled, llmConfigured else {
+        guard llmEnabled else {
+            correctionByDocument[url] = .failed("文字纠正已关闭。可在「设置 → 文字纠正」中启用。")
+            return
+        }
+        guard llmConfigured else {
             correctionByDocument[url] = .failed("文字纠正未配置服务地址或模型")
             return
         }
@@ -1597,33 +1698,44 @@ final class AppModel: ObservableObject {
     // MARK: 重新转写
 
     func retranscribeFile() {
+        guard !isRetranscribing else { return }
         let p = NSOpenPanel()
         p.allowedContentTypes = [.audio]; p.canChooseDirectories = false
         p.message = "选择要重新转写的录音(结果另存为 _重转写.md)"
         p.directoryURL = saveRoot
         guard p.runModal() == .OK, let url = p.url else { return }
+        isRetranscribing = true
         retranscribe = "正在转写…"
-        Task {
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isRetranscribing = false }
             do {
-                let asm = try await Retranscriber.run(audio: url)
+                let asm = try await Retranscriber.run(audio: url) { [weak self] ratio in
+                    let percent = Int((min(1.0, max(0.0, ratio)) * 100).rounded())
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isRetranscribing else { return }
+                        self.retranscribe = "正在转写… \(percent)%"
+                    }
+                }
                 let dur = (try? AVAudioFileDuration(url)) ?? 0
                 let out = try Retranscriber.writeMarkdown(audio: url, assembler: asm, duration: dur)
-                retranscribe = "已生成 \(out.lastPathComponent)"
-                if ProjectLibrary.contains(saveRoot, out) {
-                    await loadChildren(out.deletingLastPathComponent(), force: true)
-                    select(.document(out))
+                self.retranscribe = "已生成 \(out.lastPathComponent)"
+                if ProjectLibrary.contains(self.saveRoot, out) {
+                    await self.loadChildren(out.deletingLastPathComponent(), force: true)
+                    self.select(.document(out))
                 } else {
                     NSWorkspace.shared.activateFileViewerSelecting([out])
                 }
             } catch {
-                retranscribe = "重新转写失败:\(error.localizedDescription)"
+                self.retranscribe = "重新转写失败:\(error.localizedDescription)"
             }
         }
     }
 }
 
-import AVFoundation
 func AVAudioFileDuration(_ url: URL) throws -> Double {
     let f = try AVAudioFile(forReading: url)
-    return Double(f.length) / f.processingFormat.sampleRate
+    let sampleRate = f.processingFormat.sampleRate
+    guard sampleRate.isFinite, sampleRate > 0 else { return 0 }
+    return Double(f.length) / sampleRate
 }

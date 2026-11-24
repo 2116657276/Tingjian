@@ -10,7 +10,7 @@ trap 'trash "$STAGE"' EXIT
 OUT="$STAGE/听笺.app"
 BUILD="${TINGJIAN_BUILD_ROOT:-/tmp/tingjian-build-release}"
 
-swift build -c release -Xswiftc -gnone --disable-sandbox --scratch-path "$BUILD" --product Tingjian
+swift build -c release -debug-info-format none --disable-sandbox --scratch-path "$BUILD" --product Tingjian
 BIN="$BUILD/release/Tingjian"
 
 mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
@@ -34,7 +34,7 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
  <key>CFBundleIconFile</key><string>AppIcon</string>
  <key>CFBundlePackageType</key><string>APPL</string>
  <key>CFBundleShortVersionString</key><string>1.0.1</string>
- <key>CFBundleVersion</key><string>17</string>
+ <key>CFBundleVersion</key><string>23</string>
  <key>UTExportedTypeDeclarations</key>
  <array><dict>
   <key>UTTypeIdentifier</key><string>com.local.tingjian.workspace-item</string>

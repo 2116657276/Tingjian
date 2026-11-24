@@ -27,18 +27,17 @@ struct SettingsView: View {
                         }
                     }
 
-                    SettingsSection(title: "录音输入", detail: "按设备 uniqueID 固定输入,不修改系统默认设备;录音中也可以切换。") {
-                        SettingsFieldRow(title: "输入设备", systemImage: "mic") {
+                    SettingsSection(title: "录音输入", detail: "为以后开始的录音设置默认设备。临时换麦可使用底栏。") {
+                        SettingsFieldRow(title: "默认输入设备", systemImage: "mic") {
                             inputPicker
                         }
 
                         SettingsDivider()
 
                         HStack(alignment: .top, spacing: 8) {
-                            let name = model.activeInputDescription
                             Image(systemName: "waveform")
                                 .foregroundStyle(TingjianTheme.secondaryInk)
-                            Text(rec.isActive ? "当前实际输入:\(name)(\(rec.activeInputUID ?? "无"))" : "下次录音使用:\(name)")
+                            Text("录音默认使用：\(model.defaultInputDescription)")
                                 .font(.system(size: 11))
                                 .foregroundStyle(TingjianTheme.secondaryInk)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -49,7 +48,7 @@ struct SettingsView: View {
 
                         if model.savedInputUnavailable {
                             SettingsDivider()
-                            Text("已保存的输入设备当前不可用。请重新选择设备;未改选前开始录音会明确报错,不会悄悄换成别的麦克风。")
+                            Text("已保存的输入设备当前不可用。请重新选择设备;也可在底栏为下一次录音临时选择设备。")
                                 .settingsFootnote()
                                 .foregroundStyle(TingjianTheme.warning)
                                 .padding(.horizontal, 14)
@@ -94,23 +93,35 @@ struct SettingsView: View {
 
                         SettingsDivider()
 
+                        SettingsFieldRow(title: "中文识别模型", systemImage: "character.bubble") {
+                            SpeechModelControl()
+                        }
+
+                        SettingsDivider()
+
                         SettingsFieldRow(title: "重新转写", systemImage: "waveform.badge.magnifyingglass") {
                             Button {
                                 model.retranscribeFile()
                             } label: {
-                                Label("选择录音…", systemImage: "waveform")
+                                Label(model.isRetranscribing ? "正在转写…" : "选择录音…", systemImage: "waveform")
                             }
                             .controlSize(.small)
+                            .disabled(model.isRetranscribing)
                         }
 
                         if let status = model.retranscribe {
                             SettingsDivider()
-                            Text(status)
-                                .font(.system(size: 12))
-                                .foregroundStyle(status.hasPrefix("已生成") ? TingjianTheme.accent : TingjianTheme.secondaryInk)
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 10)
-                                .textSelection(.enabled)
+                            HStack(spacing: 8) {
+                                if model.isRetranscribing {
+                                    ProgressView().controlSize(.small)
+                                }
+                                Text(status)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(status.hasPrefix("已生成") ? TingjianTheme.accent : TingjianTheme.secondaryInk)
+                                    .textSelection(.enabled)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
                         }
                     }
 
@@ -216,7 +227,7 @@ struct SettingsView: View {
                             .disabled(model.gatewayEndpoint == nil)
                         }
 
-                        Text("每个网关地址单独保存密钥。要移除密钥，请清空后点「保存密钥」。点击「纠正文本」后，转写文字会发给当前网关。")
+                        Text("每个网关地址单独保存密钥。要移除密钥，请清空后点「保存密钥」。点击「纠正文本」后，转写文字、项目和录音目录名、文稿名及部分文稿开头信息会发给当前网关。校正结果与上下文摘要会缓存在本机。")
                             .settingsFootnote()
                             .padding(.horizontal, 14)
                             .padding(.bottom, 12)
@@ -258,7 +269,7 @@ struct SettingsView: View {
     private var inputPicker: some View {
         Picker("输入设备", selection: Binding<String?>(
             get: { model.audioInputUID },
-            set: { model.selectInput($0) }
+            set: { model.audioInputUID = $0 }
         )) {
             Text("系统默认(开始时固定)").tag(String?.none)
             ForEach(model.inputDevices) { device in
@@ -271,10 +282,8 @@ struct SettingsView: View {
         .labelsHidden()
         .pickerStyle(.menu)
         .frame(maxWidth: 320, alignment: .trailing)
-        .disabled(rec.isChangingInput)
-        .accessibilityLabel("输入设备")
-        .accessibilityValue(model.activeInputDescription)
-        .help("录音中切换会继续同一份录音;系统默认只在开始时解析一次")
+        .accessibilityLabel("默认输入设备")
+        .accessibilityValue(model.defaultInputDescription)
     }
 
     @ViewBuilder
@@ -468,5 +477,31 @@ private extension View {
             .foregroundStyle(TingjianTheme.secondaryInk)
             .lineSpacing(2)
             .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+
+struct SpeechModelControl: View {
+    @EnvironmentObject private var rec: Recorder
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let progress = rec.modelProgress {
+                ProgressView("正在下载中文识别模型", value: progress)
+            } else {
+                switch rec.speechModelState {
+                case .ready: Text("中文识别模型已就绪")
+                case .unsupported: Text("本机不支持简体中文识别")
+                case .needsDownload:
+                    Button("下载中文识别模型") { Task { await rec.installModel() } }
+                case nil: ProgressView().controlSize(.small).accessibilityLabel("正在检查中文识别模型")
+                }
+            }
+            if let error = rec.modelDownloadError {
+                Text(error).foregroundStyle(TingjianTheme.warning)
+            }
+        }
+        .font(.system(size: 12))
+        .task { await rec.refreshSpeechModelState() }
     }
 }

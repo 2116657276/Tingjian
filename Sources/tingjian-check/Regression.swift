@@ -13,6 +13,7 @@ final class GateSource: AudioSource, @unchecked Sendable {
     var uid: String?
     var sampleRate: Double = 24000
     var granted = true
+    var prepareDelay: Double = 0
     var onPrepare: (() throws -> Void)?
     var failStart = false
     var startDelay: Double = 0
@@ -29,6 +30,7 @@ final class GateSource: AudioSource, @unchecked Sendable {
 
     func prepare() async throws -> AVAudioFormat {
         prepares += 1
+        if prepareDelay > 0 { try? await Task.sleep(for: .seconds(prepareDelay)) }
         try onPrepare?()
         return AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
     }
@@ -67,14 +69,53 @@ func additionalRegressionChecks() async {
     let first = Task { await r.start(course: "first") }
     try? await Task.sleep(for: .milliseconds(20))
     let second = Task { await r.start(course: "second") }
-    await first.value; await second.value
-    await check("权限等待期间重复开始只创建一个音源", made == 1 && a.starts == 1 && b.starts == 0)
+    let didStart = await first.value
+    let didStartAgain = await second.value
+    await check("权限等待期间重复开始只创建一个音源", didStart && !didStartAgain && made == 1 && a.starts == 1 && b.starts == 0)
     await r.stop()
 
     let denied = GateSource(); denied.granted = false
     let deniedRec = Recorder(saveRoot: fresh("reg-denied-dest"), localRoot: fresh("reg-denied-local"), makeSource: { _ in denied })
-    await deniedRec.start(course: "")
-    await check("权限拒绝不启动音源且恢复空闲", denied.starts == 0 && deniedRec.phase == .idle)
+    let deniedStart = await deniedRec.start(course: "")
+    await check("权限拒绝不启动音源且恢复空闲", !deniedStart && denied.starts == 0 && deniedRec.phase == .idle)
+
+    let unloaded = MockEngine(.normal)
+    unloaded.model = .needsDownload
+    let modelSource = GateSource()
+    let modelRecorder = Recorder(saveRoot: fresh("reg-model-dest"), localRoot: fresh("reg-model-local"),
+                                 makeEngine: { unloaded }, makeSource: { _ in modelSource })
+    await modelRecorder.refreshSpeechModelState()
+    await check("开始录音前可检查中文模型状态", modelRecorder.speechModelState == .needsDownload && modelSource.starts == 0)
+    await modelRecorder.start(course: "未安装模型")
+    _ = await waitUntil(2) { modelRecorder.transcribe == .needsModel }
+    modelSource.push(frames: 24000)
+    await modelRecorder.stop()
+    await check("缺模型时仍交付音频并保留模型状态", modelRecorder.deliveredFiles != nil && modelRecorder.speechModelState == .needsDownload)
+    unloaded.failInstall = true
+    await modelRecorder.installModel()
+    await check("录后模型下载失败时保留重试状态", modelRecorder.modelProgress == nil && modelRecorder.modelDownloadError != nil)
+    unloaded.failInstall = false
+    await modelRecorder.installModel()
+    await check("录后重试可准备模型，既有录音仍可用", modelRecorder.speechModelState == .ready && modelRecorder.modelDownloadError == nil && modelRecorder.deliveredFiles != nil)
+
+    let staleProbe = MockEngine(.normal)
+    staleProbe.model = .needsDownload
+    staleProbe.modelQueryDelay = .milliseconds(300)
+    let installed = MockEngine(.normal)
+    let delayedSource = GateSource()
+    var enginesCreated = 0
+    let downloading = Recorder(saveRoot: fresh("reg-probe-dest"), localRoot: fresh("reg-probe-local"),
+                               makeEngine: {
+                                   enginesCreated += 1
+                                   return enginesCreated == 1 ? staleProbe : installed
+                               }, makeSource: { _ in delayedSource })
+    await downloading.start(course: "录音开始时完成模型准备")
+    try? await Task.sleep(for: .milliseconds(40))
+    await downloading.installModel()
+    let beganTranscribing = await waitUntil(2) { downloading.transcribe == .running }
+    await check("模型准备完成后，迟到的旧状态不阻止识别",
+                beganTranscribing && downloading.speechModelState == .ready)
+    await downloading.stop()
 
     let dir = fresh("reg-events")
     var valid = try! JSONEncoder().encode(TranscriptEvent(kind: .text, start: 0, end: 1, text: "完整的确认文字"))
@@ -93,7 +134,7 @@ func additionalRegressionChecks() async {
     let starting = Task { await canceledRec.start(course: "") }
     try? await Task.sleep(for: .milliseconds(20))
     canceledRec.cancelStarting()
-    await starting.value
+    _ = await starting.value
     await check("取消启动后权限返回也不采集", canceled.starts == 0 && canceledRec.phase == .idle)
 
     let initLocal = fresh("reg-init-local"), blockedSource = GateSource()
@@ -236,6 +277,53 @@ func additionalRegressionChecks() async {
     let afterRetry = retryCopies.count
     await retryRec.retrySave()
     await check("已保存会话不重复交付", retryCopies.count == afterRetry)
+
+    // 阶段 2 A 类修复回归：0 字识别全程失败标 .failed（不再误标 .partial）
+    let zeroFailSource = GateSource()
+    let zeroFailLocal = fresh("reg-zerofail-local")
+    let zeroFailRec = Recorder(saveRoot: fresh("reg-zerofail-dest"), localRoot: zeroFailLocal,
+                               makeEngine: { MockEngine(.failAfter(0)) }, makeSource: { _ in zeroFailSource })
+    zeroFailRec.retryDelay = 0.02
+    let zeroFailStarted = await zeroFailRec.start(course: "零字失败")
+    zeroFailSource.push(frames: 48_000)
+    _ = await waitUntil(5) {
+        if case .failed = zeroFailRec.transcribe { return zeroFailRec.duration >= 1.8 }
+        return false
+    }
+    await zeroFailRec.stop()
+    let zeroFailTexts = zeroFailRec.localDir.map { SessionStore.loadEvents(dir: $0).events.filter { $0.kind == .text } } ?? []
+    await check("录制 >1.5s 且 0 字识别全程失败收尾标 .failed",
+                zeroFailStarted && zeroFailRec.duration > 1.5 && zeroFailTexts.isEmpty
+                && zeroFailRec.finalStatus == .failed && zeroFailRec.deliveredFiles != nil,
+                "dur=\(zeroFailRec.duration) status=\(String(describing: zeroFailRec.finalStatus)) texts=\(zeroFailTexts.count)")
+
+    // 阶段 2 A 类修复回归：启动准备失败（无 audio.caf）清理空目录且 localDir == nil
+    let prepFailLocal = fresh("reg-prepfail-local")
+    let prepFailSource = GateSource()
+    prepFailSource.onPrepare = { throw AudioError.captureFailed("注入的 prepare 失败") }
+    let prepFailRec = Recorder(saveRoot: fresh("reg-prepfail-dest"), localRoot: prepFailLocal,
+                               makeEngine: { MockEngine(.normal) }, makeSource: { _ in prepFailSource })
+    let prepFailStarted = await prepFailRec.start(course: "准备失败")
+    let prepFailLeftovers = (try? FileManager.default.contentsOfDirectory(atPath: prepFailLocal.path)) ?? ["?"]
+    await check("启动准备失败时清理 localRoot 空目录且 localDir 为空",
+                !prepFailStarted && prepFailRec.phase == .idle && prepFailRec.localDir == nil && prepFailLeftovers.isEmpty,
+                "localDir=\(String(describing: prepFailRec.localDir)) leftovers=\(prepFailLeftovers)")
+
+    // 阶段 2 A 类修复回归：prepare 等待期间 cancelStarting 同样清理空目录
+    let prepCancelLocal = fresh("reg-prepcancel-local")
+    let prepCancelSource = GateSource()
+    prepCancelSource.prepareDelay = 0.25
+    let prepCancelRec = Recorder(saveRoot: fresh("reg-prepcancel-dest"), localRoot: prepCancelLocal,
+                                 makeEngine: { MockEngine(.normal) }, makeSource: { _ in prepCancelSource })
+    let prepCancelTask = Task { await prepCancelRec.start(course: "准备取消") }
+    _ = await waitUntil(2) { prepCancelSource.prepares == 1 }
+    prepCancelRec.cancelStarting()
+    let prepCancelStarted = await prepCancelTask.value
+    let prepCancelLeftovers = (try? FileManager.default.contentsOfDirectory(atPath: prepCancelLocal.path)) ?? ["?"]
+    await check("启动准备期间取消时清理 localRoot 空目录且 localDir 为空",
+                !prepCancelStarted && prepCancelRec.phase == .idle && prepCancelRec.localDir == nil
+                && prepCancelSource.starts == 0 && prepCancelLeftovers.isEmpty,
+                "localDir=\(String(describing: prepCancelRec.localDir)) leftovers=\(prepCancelLeftovers)")
 }
 
 /// 保存目标在会话开始时固定:开始后再改 saveRoot 不影响本次交付。
@@ -386,11 +474,70 @@ func libraryRegressionChecks() async {
         let updated = try String(contentsOf: result, encoding: .utf8)
         await check("改名更新自引用且旧位置无副本",
                     updated == "[[课件.md]]" && !FileManager.default.fileExists(atPath: file.path))
-        let unit = try await library.moveUnit(for: fixture.bundle.appendingPathComponent("新音频.caf"))
-        let independent = try await library.moveUnit(for: result)
-        await check("配对音频移动整份录音，独立文稿移动自身", unit.resolvingSymlinksInPath().path == fixture.bundle.resolvingSymlinksInPath().path && independent.resolvingSymlinksInPath().path == result.resolvingSymlinksInPath().path,
-                    "移动对象 \(unit.path)，独立文件 \(independent.path)")
+        let unit = try await library.movePlan(for: fixture.bundle.appendingPathComponent("新音频.caf"))
+        let fromDocument = try await library.movePlan(for: fixture.bundle.appendingPathComponent("课堂记录.md"))
+        let independent = try await library.movePlan(for: result)
+        let expectedFolder = fixture.bundle.standardizedFileURL.path
+        await check("从音频或文稿移动整份独立录音，普通文稿只移动自身",
+                    unit.sources.map { $0.path } == [expectedFolder]
+                    && fromDocument.sources.map { $0.path } == [expectedFolder]
+                    && Set(fromDocument.recordings) == Set(["新音频.caf", "课堂记录.md", fixture.corrected.lastPathComponent])
+                    && independent.sources.map { $0.path } == [result.standardizedFileURL.path],
+                    "音频 \(unit.recordings)，文稿 \(fromDocument.recordings)")
     } catch { await check("自引用改名与移动对象", false, error.localizedDescription) }
+
+    do {
+        let source = root.appendingPathComponent("混放项目", isDirectory: true)
+        let target = root.appendingPathComponent("项目乙", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        let audio = source.appendingPathComponent("旧录音]第二版.m4a")
+        let doc = source.appendingPathComponent("课堂.md")
+        let corrected = source.appendingPathComponent("课堂校正版.md")
+        let unrelated = source.appendingPathComponent("另一个项目说明.md")
+        try Data([1, 2, 3]).write(to: audio)
+        let reference = "# 课堂\n![[旧录音]第二版.m4a]]\n"
+        try reference.write(to: doc, atomically: true, encoding: .utf8)
+        try reference.write(to: corrected, atomically: true, encoding: .utf8)
+        try "保留在原处".write(to: unrelated, atomically: true, encoding: .utf8)
+        await check("旧录音名称含右方括号时仍可识别",
+                    ProjectLibrary.linkedAudio(in: reference, beside: doc)?.lastPathComponent == audio.lastPathComponent)
+        let plan = try await library.movePlan(for: doc)
+        await check("混放项目只确认移动配对音频和关联文稿",
+                    Set(plan.sources.map(\.lastPathComponent)) == Set([audio.lastPathComponent, doc.lastPathComponent, corrected.lastPathComponent]))
+        let collision = target.appendingPathComponent(corrected.lastPathComponent)
+        try "目标已存在".write(to: collision, atomically: true, encoding: .utf8)
+        do {
+            _ = try await library.move(plan, into: target)
+            await check("同名冲突时整组保留在原目录", false)
+        } catch {
+            await check("同名冲突时整组保留在原目录",
+                        plan.sources.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }
+                        && !FileManager.default.fileExists(atPath: target.appendingPathComponent(audio.lastPathComponent).path))
+        }
+        let otherTarget = root.appendingPathComponent("配对移动目标", isDirectory: true)
+        try FileManager.default.createDirectory(at: otherTarget, withIntermediateDirectories: false)
+        _ = try await library.move(plan, into: otherTarget)
+        let movedDoc = otherTarget.appendingPathComponent(doc.lastPathComponent)
+        let movedAudio = otherTarget.appendingPathComponent(audio.lastPathComponent)
+        await check("混放项目移动后音频和文稿同目录，其他材料留在原处",
+                    ProjectLibrary.linkedAudio(in: reference, beside: movedDoc)?.lastPathComponent == audio.lastPathComponent
+                    && FileManager.default.fileExists(atPath: unrelated.path)
+                    && plan.sources.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+
+        let renamed = try await library.rename(movedAudio, to: "可回听的录音")
+        let updated = try String(contentsOf: movedDoc, encoding: .utf8)
+        await check("已有方括号文件改为普通名称后更新并读回音频引用",
+                    ProjectLibrary.linkedAudio(in: updated, beside: movedDoc)?.lastPathComponent == renamed.lastPathComponent)
+        do {
+            _ = try await library.rename(renamed, to: "录音]第三版")
+            await check("拒绝会破坏 Markdown 引用的新名称", false)
+        } catch LibraryError.invalidName {
+            await check("拒绝会破坏 Markdown 引用的新名称",
+                        FileManager.default.fileExists(atPath: renamed.path)
+                        && (try? String(contentsOf: movedDoc, encoding: .utf8)) == updated)
+        }
+        await check("新录音文件名清理方括号，正常课程名保持可用", Paths.sanitize("网络[实验]") == "网络-实验-")
+    } catch { await check("配对移动与方括号兼容", false, error.localizedDescription) }
 
     do {
         _ = try await library.createProject(named: "项目丙", in: root)
@@ -520,6 +667,34 @@ func libraryRegressionChecks() async {
                     audioEntry?.isRecordingBundle == true && docEntry?.isRecordingBundle == false
                     && docEntries.map(\.kind) == [.document])
     } catch { await check("只有音频或只有文稿的目录仍可枚举", false, "\(error)") }
+
+    // 阶段 2 A 类修复回归：混放目录含非 UTF-8 无关 .md 时，正常文件 movePlan / move 不被阻塞
+    do {
+        let mixedDir = root.appendingPathComponent("混放含坏编码", isDirectory: true)
+        let moveDest = root.appendingPathComponent("坏编码移动目标", isDirectory: true)
+        try FileManager.default.createDirectory(at: mixedDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: moveDest, withIntermediateDirectories: true)
+        let goodAudio = mixedDir.appendingPathComponent("课堂.m4a")
+        let goodDoc = mixedDir.appendingPathComponent("课堂.md")
+        let badEncodingDoc = mixedDir.appendingPathComponent("损坏编码.md")
+        try Data([1, 2, 3, 4]).write(to: goodAudio)
+        try "# 课堂\n![[课堂.m4a]]\n".write(to: goodDoc, atomically: true, encoding: .utf8)
+        try Data([0x80, 0xFF, 0xFE, 0xC0]).write(to: badEncodingDoc)
+
+        let docPlan = try await library.movePlan(for: goodDoc)
+        let audioPlan = try await library.movePlan(for: goodAudio)
+        let expectedNames = Set([goodAudio.lastPathComponent, goodDoc.lastPathComponent])
+        _ = try await library.move(docPlan, into: moveDest)
+        await check("混放目录非 UTF-8 无关 .md 不阻塞正常文件移动",
+                    Set(docPlan.sources.map(\.lastPathComponent)) == expectedNames
+                    && Set(audioPlan.sources.map(\.lastPathComponent)) == expectedNames
+                    && FileManager.default.fileExists(atPath: moveDest.appendingPathComponent(goodDoc.lastPathComponent).path)
+                    && FileManager.default.fileExists(atPath: moveDest.appendingPathComponent(goodAudio.lastPathComponent).path)
+                    && FileManager.default.fileExists(atPath: badEncodingDoc.path),
+                    "docPlan=\(docPlan.sources.map(\.lastPathComponent))")
+    } catch {
+        await check("混放目录非 UTF-8 无关 .md 不阻塞正常文件移动", false, "\(error)")
+    }
 }
 
 // MARK: 输入切换
@@ -584,6 +759,24 @@ func inputSwitchRegressionChecks() async {
     await paused.stop()
     await check("暂停中切换后仍可结束保存", paused.deliveredFiles != nil)
 
+    let oldInput = GateSource(); oldInput.uid = "old-input"
+    let newInput = GateSource(); newInput.uid = "new-input"
+    let queued = Recorder(saveRoot: fresh("reg-input-queued-dest"), localRoot: fresh("reg-input-queued-local"),
+                          makeEngine: { MockEngine(.normal) }, makeSource: { uid in uid == "new-input" ? newInput : oldInput })
+    await queued.start(course: "继续时更换设备")
+    await queued.inputDeviceDisconnected("old-input")
+    await check("输入断开出现暂停提示", queued.phase == .paused && queued.inputIssue != nil)
+    oldInput.startDelay = 0.2
+    let resume = Task { await queued.resume() }
+    try? await Task.sleep(for: .milliseconds(30))
+    do { try await queued.switchInput(to: "new-input") }
+    catch { await check("继续录音时排队换麦", false, error.localizedDescription) }
+    await resume.value
+    await check("慢速继续后接续换麦，新音源开始采集",
+                queued.phase == .recording && queued.activeInputUID == "new-input" && newInput.starts == 1)
+    await check("换麦恢复后清除设备断开提示", queued.inputIssue == nil)
+    await queued.stop()
+
     // 新设备启动失败:恢复旧源并继续录音。
     let e = GateSource(); e.uid = "mic-e"
     let f = GateSource(); f.uid = "mic-f"; f.failStart = true
@@ -614,7 +807,7 @@ func inputSwitchRegressionChecks() async {
     await stuck.pause()
     g.failStart = true
     await stuck.resume()
-    await check("继续失败保持暂停并保留补救入口", stuck.phase == .paused && stuck.message != nil)
+    await check("继续失败保持暂停并保留补救入口", stuck.phase == .paused && stuck.inputIssue != nil)
     await stuck.stop()
     await check("无法恢复时仍可结束保存", stuck.deliveredFiles != nil)
 
@@ -630,7 +823,7 @@ func inputSwitchRegressionChecks() async {
     h.failStart = true
     do { try await bothFail.switchInput(to: "mic-i"); await check("原设备与新设备都失败时报错", false) }
     catch { await check("原设备与新设备都失败时报错", true) }
-    await check("原设备与新设备都失败时保持暂停", bothFail.phase == .paused && bothFail.message != nil)
+    await check("原设备与新设备都失败时保持暂停", bothFail.phase == .paused && bothFail.inputIssue != nil)
     await bothFail.stop()
     await check("双设备失败后仍可结束并保存已录部分", bothFail.deliveredFiles != nil)
 
@@ -641,7 +834,7 @@ func inputSwitchRegressionChecks() async {
     let starting = Task { await cancelRec.start(course: "取消") }
     try? await Task.sleep(for: .milliseconds(180))
     cancelRec.cancelStarting()
-    await starting.value
+    _ = await starting.value
     try? await Task.sleep(for: .milliseconds(400))
     await check("取消启动后迟到返回不进入录音", cancelRec.phase == .idle && cancelRec.deliveredFiles == nil)
 }

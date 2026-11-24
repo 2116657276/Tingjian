@@ -45,10 +45,13 @@ public final class Recorder: ObservableObject {
     @Published public private(set) var transcribe: TranscribeState = .idle
     @Published public private(set) var save: SaveState = .idle
     @Published public private(set) var message: String?
+    @Published public private(set) var inputIssue: String?
     @Published public private(set) var deliveredDir: URL?
     @Published public private(set) var deliveredFiles: DeliveryResult?
     @Published public private(set) var persistenceIssue: String?
     @Published public private(set) var localDir: URL?
+    @Published public private(set) var speechModelState: ModelState?
+    @Published public private(set) var modelDownloadError: String?
     @Published public private(set) var modelProgress: Double?
     @Published public private(set) var finalStatus: TranscriptStatus?
     @Published public private(set) var activeInputUID: String?
@@ -68,6 +71,7 @@ public final class Recorder: ObservableObject {
     public var makeSource: (String?) -> AudioSource
     public var finishTimeout: TimeInterval = 20
     public var retryDelay: TimeInterval = 2
+    @_spi(Testing) public var speechEnhancement = SpeechEnhancer.Config()
 
     private var source: AudioSource?
     private var pipeline: AudioPipeline?
@@ -115,12 +119,13 @@ public final class Recorder: ObservableObject {
 
     // MARK: 开始 / 暂停 / 继续 / 结束
 
-    public func start(course: String, draftID: UUID? = nil, destination: URL? = nil, placement: RecordingPlacement? = nil) async {
-        guard phase == .idle || phase == .finished else { return }
+    @discardableResult
+    public func start(course: String, draftID: UUID? = nil, destination: URL? = nil, placement: RecordingPlacement? = nil) async -> Bool {
+        guard phase == .idle || phase == .finished else { return false }
         switch save {
         case .pending, .failed:
             message = "上次录音尚未保存到目标目录,请先重试保存,再开始新的录音。"
-            return
+            return false
         default:
             break
         }
@@ -135,11 +140,11 @@ public final class Recorder: ObservableObject {
         let input = makeSource(preferredInputUID)
         startupSource = input
         let granted = await input.requestAccess()
-        guard generation == startupGeneration, phase == .starting else { await input.stop(); return }
+        guard generation == startupGeneration, phase == .starting else { await input.stop(); return false }
         guard granted else {
             await input.stop(); startupSource = nil; phase = .idle
             message = "没有麦克风权限。请在系统设置的麦克风权限中允许听笺。"
-            return
+            return false
         }
         var workDir: URL?
         var pendingPipeline: AudioPipeline?
@@ -148,8 +153,13 @@ public final class Recorder: ObservableObject {
             workDir = dir
             let format = try await input.prepare()
             guard generation == startupGeneration, phase == .starting else {
-                await input.stop(); startupSource = nil
-                return
+                await input.stop()
+                if startupSource === input { startupSource = nil }
+                let readableFrames = (try? AVAudioFile(forReading: dir.appendingPathComponent(SessionFiles.audio)).length)
+                if (readableFrames ?? 0) == 0 {
+                    try? FileManager.default.trashItem(at: dir, resultingItemURL: nil)
+                }
+                return false
             }
             var info = SessionInfo(baseName: dir.lastPathComponent, course: course, startedAt: Date(), state: .recording)
             info.sampleRate = format.sampleRate
@@ -157,7 +167,7 @@ public final class Recorder: ObservableObject {
             info.sessionDestination = sessionSaveRoot
             info.recordingPlacement = placement
             let store = SessionStore(dir: dir, info: info)
-            let pipeline = try AudioPipeline(url: store.audioURL, sampleRate: format.sampleRate)
+            let pipeline = try AudioPipeline(url: store.audioURL, sampleRate: format.sampleRate, enhancement: speechEnhancement)
             pendingPipeline = pipeline
             try store.prepare()
             pipeline.onWriteFailure = { [weak self] msg in Task { @MainActor in self?.handleWriteFailure(msg) } }
@@ -169,12 +179,21 @@ public final class Recorder: ObservableObject {
             guard generation == startupGeneration, phase == .starting else {
                 await input.stop()
                 let samples = await pendingPipeline?.close() ?? 0
-                self.source = nil; self.pipeline = nil; self.store = nil; localDir = nil
-                sourceGeneration += 1
-                if samples == 0 { try? FileManager.default.trashItem(at: dir, resultingItemURL: nil) }
-                phase = .idle
-                sessionSaveRoot = nil
-                return
+                if startupSource === input { startupSource = nil }
+                if self.source === input { self.source = nil }
+                if self.pipeline === pendingPipeline { self.pipeline = nil }
+                if self.store === store { self.store = nil }
+                if self.localDir == dir { self.localDir = nil }
+                if generation == startupGeneration {
+                    sourceGeneration += 1
+                    phase = .idle
+                    sessionSaveRoot = nil
+                }
+                let readableFrames = (try? AVAudioFile(forReading: dir.appendingPathComponent(SessionFiles.audio)).length)
+                if samples == 0 && (readableFrames ?? 0) == 0 {
+                    try? FileManager.default.trashItem(at: dir, resultingItemURL: nil)
+                }
+                return false
             }
             activeInputUID = input.activeDeviceUID
             activeInputName = input.activeDeviceName
@@ -183,20 +202,38 @@ public final class Recorder: ObservableObject {
             startupSource = nil
             phase = .recording
             beginTicking(); observeSleep(); startEngine(replayFrom: 0)
+            return true
         } catch {
-            await input.stop(); startupSource = nil
+            await input.stop()
+            if startupSource === input { startupSource = nil }
             let samples = await pendingPipeline?.close() ?? 0
-            guard generation == startupGeneration else { return }
+            let isEmptyWorkDir: Bool
+            if let dir = workDir {
+                let readableFrames = (try? AVAudioFile(forReading: dir.appendingPathComponent(SessionFiles.audio)).length)
+                isEmptyWorkDir = samples == 0 && (readableFrames ?? 0) == 0
+            } else {
+                isEmptyWorkDir = false
+            }
+            guard generation == startupGeneration else {
+                if let dir = workDir, isEmptyWorkDir {
+                    try? FileManager.default.trashItem(at: dir, resultingItemURL: nil)
+                }
+                return false
+            }
             self.source = nil; self.pipeline = nil; self.store = nil
             sourceGeneration += 1
             if let dir = workDir {
-                let readableFrames = (try? AVAudioFile(forReading: dir.appendingPathComponent(SessionFiles.audio)).length)
-                if samples == 0 && readableFrames == 0 { try? FileManager.default.trashItem(at: dir, resultingItemURL: nil); localDir = nil }
-                else { localDir = dir }
+                if isEmptyWorkDir {
+                    try? FileManager.default.trashItem(at: dir, resultingItemURL: nil)
+                    localDir = nil
+                } else {
+                    localDir = dir
+                }
             }
             phase = .idle
             sessionSaveRoot = nil
             message = "无法开始录音:\(error.localizedDescription)"
+            return false
         }
     }
 
@@ -230,13 +267,15 @@ public final class Recorder: ObservableObject {
             guard self.phase == .paused, !self.stopping else { return }
             do {
                 if rebuild { try await current?.restart() } else { try await current?.start() }
+                guard !self.stopping, self.phase == .paused else { return }
+                self.inputIssue = nil
                 self.phase = .recording
             } catch {
                 failure = error.localizedDescription
             }
         }
-        if let failure {
-            message = "无法继续录音:\(failure)。已保留已录部分,可更换输入设备后继续,或结束保存。"
+        if let failure, phase == .paused, !stopping {
+            inputIssue = "无法继续录音:\(failure)。已保留已录部分,可更换输入设备后继续,或结束保存。"
             needsInputRebuild = true
         }
     }
@@ -250,16 +289,17 @@ public final class Recorder: ObservableObject {
         isChangingInput = true
         defer { isChangingInput = false }
 
-        let wasRecording = phase == .recording
-        let previous = source
-        let previousName = activeInputName
         var failure: Error?
 
         await runInput {
-            guard !self.stopping, let pipeline = self.pipeline else {
+            guard !self.stopping, self.phase == .recording || self.phase == .paused,
+                  let pipeline = self.pipeline else {
                 failure = AudioError.captureFailed("录音已经结束")
                 return
             }
+            let wasRecording = self.phase == .recording
+            let previous = self.source
+            let previousName = self.activeInputName
             await previous?.pause()
             let candidate = self.makeSource(uid)
             self.sourceGeneration += 1
@@ -273,6 +313,11 @@ public final class Recorder: ObservableObject {
                     return
                 }
                 if wasRecording { try await candidate.start() }
+                if self.stopping {
+                    failure = AudioError.captureFailed("录音已经结束")
+                    await candidate.stop()
+                    return
+                }
             } catch {
                 failure = error
                 await candidate.stop()
@@ -286,14 +331,14 @@ public final class Recorder: ObservableObject {
                         catch {
                             self.phase = .paused
                             self.needsInputRebuild = true
-                            self.message = "麦克风不可用,请选择输入设备或结束保存。\(error.localizedDescription)"
+                            self.inputIssue = "麦克风不可用,请选择输入设备或结束保存。\(error.localizedDescription)"
                             self.addNote("切换输入失败,原麦克风也无法恢复:\(error.localizedDescription)。录音已暂停。")
                         }
                     }
                 } else if wasRecording, self.phase == .recording, !self.stopping {
                     self.phase = .paused
                     self.needsInputRebuild = true
-                    self.message = "麦克风不可用,请选择输入设备或结束保存。"
+                    self.inputIssue = "麦克风不可用,请选择输入设备或结束保存。"
                 }
                 return
             }
@@ -302,7 +347,7 @@ public final class Recorder: ObservableObject {
             self.activeInputName = candidate.activeDeviceName
             self.needsInputRebuild = false
             self.interruptionRetried = false
-            self.preferredInputUID = uid
+            self.inputIssue = nil
             if wasRecording {
                 let name = candidate.activeDeviceName ?? uid
                 self.addNote("麦克风由 \(previousName ?? "原设备") 切换为 \(name),切换期间未采集声音。")
@@ -317,8 +362,9 @@ public final class Recorder: ObservableObject {
         guard uid == activeInputUID, phase == .recording || phase == .paused, !stopping else { return }
         let wasRecording = phase == .recording
         if wasRecording { await pause() }
+        guard uid == activeInputUID, phase == .paused, !stopping else { return }
         needsInputRebuild = true
-        message = "输入设备已断开,录音已暂停。请选择可用的输入设备后继续,或结束保存。"
+        inputIssue = "输入设备已断开,录音已暂停。请选择可用的输入设备后继续,或结束保存。"
         if wasRecording { addNote("输入设备已断开,录音暂停。") }
     }
 
@@ -334,6 +380,9 @@ public final class Recorder: ObservableObject {
         await current?.stop()
         stopTicking()
         let samples = await pipeline.close()
+        if pipeline.failed, !notes.contains(where: { $0.contains("音频无法写入") }) {
+            addNote("音频写入或重采样收尾失败，已保留可读取的录音。")
+        }
         store.info.savedSamples = samples
         store.info.state = .finalizing
         persistMetadata()
@@ -346,7 +395,7 @@ public final class Recorder: ObservableObject {
         if engineLive, let engine {
             transcribe = .finishing
             engineOK = await race(timeout: finishTimeout, onTimeout: false) { await engine.finish() }
-            if !engineOK { notes.append("结束时转写未能在 \(Int(finishTimeout)) 秒内收尾,末尾部分文字可能缺失。") }
+            if !engineOK { notes.append("转写收尾失败或超时，末尾部分文字可能缺失。") }
         } else {
             engineTask?.cancel()
             engineOK = false
@@ -354,14 +403,16 @@ public final class Recorder: ObservableObject {
         engineLive = false
         engineGen += 1
         if !engineOK, let engine { Task { await engine.cancel() } }
+        // 结束时清空未转正的临时文本,避免界面残留幽灵 volatile
+        assembler.clearVolatile()
         // 引擎没有覆盖到的末段标记为不完整,不编造内容
         let uncovered = duration - assembler.lastEnd
         if !engineOK && uncovered > 1 { record(assembler.markGap(start: assembler.lastEnd, end: duration)) }
         publishAssembler()
         let m4a = await m4aTask.value
         let status: TranscriptStatus
-        if assembler.events.isEmpty && !engineOK { status = .failed }
-        else if !engineOK || assembler.segments.contains(where: \.incomplete) { status = .partial }
+        if !assembler.events.contains(where: { $0.kind == .text }) && !engineOK { status = .failed }
+        else if !engineOK || pipeline.failed || assembler.segments.contains(where: \.incomplete) { status = .partial }
         else { status = .completed }
         transcribe = status == .completed ? .done : .incomplete
         await finishSession(store: store, m4a: m4a, duration: duration, status: status)
@@ -608,7 +659,10 @@ public final class Recorder: ObservableObject {
         engine = eng
         engineLive = false
         engineTask = Task { [weak self] in
-            switch await eng.modelState() {
+            let state = await eng.modelState()
+            guard self?.engineGen == gen else { return }
+            if self?.modelProgress == nil { self?.speechModelState = state }
+            switch state {
             case .unsupported: self?.engineUnavailable(gen, .unsupported); return
             case .needsDownload: self?.engineUnavailable(gen, .needsModel); return
             case .ready: break
@@ -643,39 +697,95 @@ public final class Recorder: ObservableObject {
     private func engineUnavailable(_ gen: Int, _ s: TranscribeState) {
         guard gen == engineGen else { return }
         transcribe = s
-        message = s == .needsModel ? "中文识别模型尚未安装。录音继续;点击“下载中文模型”后会补转最近两分钟。" : "本机不支持中文识别。录音继续。"
+        if s == .unsupported { message = "本机不支持中文识别。录音继续。" }
+    }
+
+    private var modelInstallGeneration = 0
+
+    public func refreshSpeechModelState() async {
+        guard modelProgress == nil else { return }
+        let generation = modelInstallGeneration
+        let state = await makeEngine().modelState()
+        guard modelProgress == nil, generation == modelInstallGeneration else { return }
+        speechModelState = state
     }
 
     public func installModel() async {
-        guard transcribe == .needsModel, let engine else { return }
+        guard modelProgress == nil else { return }
+        let installer = makeEngine()
+        modelInstallGeneration += 1
         modelProgress = 0
+        modelDownloadError = nil
+        defer { modelProgress = nil }
         do {
-            try await engine.installModel { [weak self] p in Task { @MainActor in self?.modelProgress = p } }
-            modelProgress = nil; message = nil
-            if phase == .recording || phase == .paused { startEngine(replayFrom: assembler.lastEnd) }
+            try await installer.installModel { [weak self] progress in
+                Task { @MainActor in
+                    if self?.modelProgress != nil { self?.modelProgress = progress }
+                }
+            }
+            let state = await installer.modelState()
+            speechModelState = state
+            guard state == .ready else { throw EngineError.modelMissing }
+            if transcribe == .needsModel || transcribe == .preparing,
+               phase == .recording || phase == .paused {
+                engineTask?.cancel()
+                startEngine(replayFrom: assembler.lastEnd)
+            }
         } catch {
-            modelProgress = nil
-            message = "模型下载失败:\(error.localizedDescription)"
+            modelDownloadError = "模型下载失败：\(error.localizedDescription)"
         }
     }
 
+    private static let timelineEpsilon = 0.0001
+
     private func onVolatile(_ gen: Int, _ text: String, _ start: Double) {
-        guard gen == engineGen, start + 0.0001 >= engineBoundary else { return }
-        assembler.setVolatile(text, start: start)
-        volatileText = assembler.volatileText
+        guard gen == engineGen, start.isFinite else { return }
+        let boundary = max(engineBoundary, assembler.lastEnd)
+        // 允许弱音/气口声学重切分带来的轻微回退,但过滤明显早于已提交/恢复边界的迟到旧结果
+        guard start + 0.25 >= boundary else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clampedStart = max(start, boundary)
+        guard assembler.canUpdateVolatile(at: clampedStart + Self.timelineEpsilon) else { return }
+        let isRollback = start + Self.timelineEpsilon < boundary
+        if trimmed.isEmpty {
+            assembler.clearVolatile()
+            volatileText = assembler.volatileText
+            return
+        }
+        if isRollback {
+            guard let display = assembler.resolveOverlappingVolatile(text: trimmed, start: start) else {
+                assembler.clearVolatileIfNotAfter(boundary + Self.timelineEpsilon)
+                volatileText = assembler.volatileText
+                return
+            }
+            assembler.setVolatile(display, start: clampedStart)
+        } else {
+            assembler.setVolatile(trimmed, start: clampedStart)
+        }
+        if volatileText != assembler.volatileText { volatileText = assembler.volatileText }
     }
 
     private func onFinal(_ gen: Int, _ start: Double, _ end: Double, _ text: String) {
-        guard gen == engineGen else { return }
+        guard gen == engineGen, start.isFinite, end.isFinite else { return }
         let boundary = max(engineBoundary, assembler.lastEnd)
-        guard end > boundary else { return }
-        guard start + 0.0001 >= boundary else {
-            record(assembler.markGap(start: boundary, end: end))
-            addNote("识别结果与已确认时间范围重叠，已标为转写不完整。")
-            publishAssembler(); return
+        // 完全落于已提交边界之前的旧结果(如故障重启后的历史重复补喂)直接忽略
+        guard end > boundary + Self.timelineEpsilon else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let effectiveText: String
+        // 仅在时间戳回退重叠时做去重/前缀剥离;无时间重叠的真实复述不做去重
+        if start + Self.timelineEpsilon < boundary {
+            guard let resolved = assembler.resolveOverlappingFinal(text: trimmed, start: start, end: end, boundary: boundary) else {
+                return
+            }
+            effectiveText = resolved
+        } else {
+            effectiveText = trimmed
         }
+        // 正常流式识别中弱音/气口重切分导致的轻微时间戳重叠:钳位起始时间并保留有效文字,不误标 gap
+        let clampedStart = max(start, boundary)
         attempts = 0
-        record(assembler.commit(start: start, end: end, text: text))
+        record(assembler.commit(start: clampedStart, end: end, text: effectiveText))
         publishAssembler()
         pipeline?.ring.trim(before: assembler.lastEnd)
     }
@@ -686,6 +796,8 @@ public final class Recorder: ObservableObject {
         pipeline?.attach(nil, replayFrom: nil)
         let old = engine
         Task { await old?.cancel() }
+        assembler.clearVolatile()
+        publishAssembler()
         attempts += 1
         guard attempts <= 3, phase == .recording || phase == .paused else {
             transcribe = .failed(error.localizedDescription)
@@ -751,7 +863,7 @@ public final class Recorder: ObservableObject {
         }
         if phase == .paused {
             needsInputRebuild = true
-            message = "\(reason)。录音已暂停,继续前会重新打开输入设备。"
+            inputIssue = "\(reason)。录音已暂停,继续前会重新打开输入设备。"
             return
         }
         Task { await self.recoverInput(reason: reason, generation: generation) }
@@ -761,7 +873,7 @@ public final class Recorder: ObservableObject {
         guard phase == .recording else { return }
         await pause()
         needsInputRebuild = true
-        message = "\(reason)。请选择可用的输入设备或结束保存;已录部分保留。"
+        inputIssue = "\(reason)。请选择可用的输入设备或结束保存;已录部分保留。"
         addNote("\(reason),录音暂停。")
     }
 
@@ -771,7 +883,7 @@ public final class Recorder: ObservableObject {
         guard !interruptionRetried else {
             await pause()
             needsInputRebuild = true
-            message = "\(reason)。录音已暂停,请选择输入设备或结束保存。"
+            inputIssue = "\(reason)。录音已暂停,请选择输入设备或结束保存。"
             return
         }
         interruptionRetried = true
@@ -785,7 +897,7 @@ public final class Recorder: ObservableObject {
         if let failure {
             await pause()
             needsInputRebuild = true
-            message = "麦克风不可用,请选择输入设备或结束保存。\(failure)"
+            inputIssue = "麦克风不可用,请选择输入设备或结束保存。\(failure)"
             addNote("\(reason),无法自动恢复录音:\(failure)。录音已暂停。")
         } else if phase == .recording {
             addNote("\(reason),已自动恢复录音。")
@@ -891,7 +1003,7 @@ public final class Recorder: ObservableObject {
         segments = []; volatileText = ""; duration = 0; level = 0
         stopTicking()
         transcribe = .idle; save = .idle; message = nil; deliveredDir = nil; deliveredFiles = nil; localDir = nil
-        modelProgress = nil; finalStatus = nil
+        finalStatus = nil; inputIssue = nil
         assembler = TranscriptAssembler(); notes = []; attempts = 0; stopping = false
         engine = nil; engineLive = false; pendingFiles = nil
         metadataError = nil; journalError = nil; persistenceIssue = nil; hadPersistenceFailure = false; engineBoundary = 0; tickCount = 0

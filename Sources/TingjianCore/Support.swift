@@ -41,9 +41,10 @@ public enum Paths {
             .appendingPathComponent("听笺/Sessions", isDirectory: true)
     }
 
+    static let invalidFileNameCharacters = CharacterSet(charactersIn: "/\\:*?\"<>|[]").union(.newlines).union(.controlCharacters)
+
     public static func sanitize(_ course: String) -> String {
-        let bad = CharacterSet(charactersIn: "/\\:*?\"<>|").union(.newlines).union(.controlCharacters)
-        let cleaned = course.components(separatedBy: bad).joined(separator: "-")
+        let cleaned = course.components(separatedBy: invalidFileNameCharacters).joined(separator: "-")
             .trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: ".")))
         return String(cleaned.prefix(40))
     }

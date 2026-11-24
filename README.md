@@ -38,6 +38,8 @@ TINGJIAN_CHECK_ROOT=/tmp/tingjian-check-$(date +%Y%m%d-%H%M%S) \
 
 文字纠正默认执行模拟检查，`--skip-correction` 跳过；`--real` 启用真实识别，`--magpie` 启用真实 Magpie 网关。网关失败如实保留，不用重试掩盖。
 
+`--weak-voice-bench` 以实时速度验证五组固定合成语音，`--weak-voice-holdout` 使用第二份合成讲稿。`TINGJIAN_CHECK_AUDIO` 可为原讲稿复用相同内容的合成音频。`TINGJIAN_BENCH_CASE=combined-weak` 单跑组合弱音，`TINGJIAN_BENCH_FAST_RESULTS`、`TINGJIAN_BENCH_GAIN_RISE`、`TINGJIAN_BENCH_GATE_HZ` 分别控制快速识别、增益上升时间（秒）和侧链高通频率（Hz），仅用于基准对照。`--audio-regressions-only` 运行不依赖语音模型的音频专项，`--long-only` 用模拟引擎尽速处理 30 分钟合成音频并验证交付。
+
 桌面验收同时设置 `TINGJIAN_TEST_ROOT` 与 `TINGJIAN_TEST_AUDIO`，确认窗口显示隔离资料库后再操作；不打开真实麦克风，不写正式保存目录。真实设备、睡眠、iCloud 跨设备同步和课堂识别效果列为未验证项，交由用户验收。
 
 有实质验证时，在 `docs/verification/YYYY-MM-DD/` 新增记录，写清范围、环境、结果和未验证项，并更新 [验证归档索引](docs/verification/README.md)。历史记录保留原结论并标明日期，不作为当前缺陷或版本说明。

@@ -21,6 +21,12 @@ public struct LibraryEntry: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct LibraryMovePlan: Equatable, Sendable {
+    public let item: URL
+    public let sources: [URL]
+    public let recordings: [String]
+}
+
 public enum LibraryError: Error, LocalizedError, Equatable {
     case outsideLibrary(String)
     case rootNotMutable
@@ -230,7 +236,8 @@ public actor ProjectLibrary {
         }
 
         let links = Dictionary(uniqueKeysWithValues: names.map { ("[[" + $0.key + "]]", "[[" + $0.value + "]]") })
-        let linkPattern = try NSRegularExpression(pattern: #"\[\[[^\]\n]+\]\]"#)
+        let escapedLinks = links.keys.sorted { $0.count > $1.count }.map(NSRegularExpression.escapedPattern(for:))
+        let linkPattern = try NSRegularExpression(pattern: escapedLinks.isEmpty ? "(?!)" : escapedLinks.joined(separator: "|"))
         let writeRoot = kind == .directory ? destination : parent
         var edits: [(target: URL, original: Data, updated: Data)] = []
         for child in children where Self.isDocument(child) && !child.lastPathComponent.hasPrefix(".") {
@@ -301,45 +308,120 @@ public actor ProjectLibrary {
         if let writeError { throw writeError }
     }
 
-    public func moveUnit(for item: URL) throws -> URL {
+    public func movePlan(for item: URL) throws -> LibraryMovePlan {
         let url = item.standardizedFileURL
         try requireInside(url)
-        guard try kindOf(url) != .directory else { return url }
+        try requireNotSymlink(url)
+        let single = LibraryMovePlan(item: url, sources: [url], recordings: [])
+        let kind = try kindOf(url)
+        guard kind != .directory else { return single }
+
         let parent = url.deletingLastPathComponent()
-        guard parent.resolvingSymlinksInPath().path != root.resolvingSymlinksInPath().path else { return url }
         let entries = try children(of: parent, classifyDirectories: false)
         let audioNames = Set(entries.filter { $0.kind == .audio }.map(\.name))
-        for entry in entries where entry.kind == .document && (Self.isAudio(url) || entry.url.path == url.path) {
-            let text = try String(contentsOf: entry.url, encoding: .utf8)
-            if let audio = Self.linkedAudio(in: text, beside: entry.url, available: audioNames),
-               Self.isDocument(url) || audio.lastPathComponent == url.lastPathComponent {
-                return parent
+        guard !audioNames.isEmpty else { return single }
+
+        var documentsByAudio: [URL: [URL]] = [:]
+        for entry in entries where entry.kind == .document {
+            let text: String
+            if entry.url.standardizedFileURL == url {
+                text = try String(contentsOf: entry.url, encoding: .utf8)
+            } else {
+                guard let content = try? String(contentsOf: entry.url, encoding: .utf8) else { continue }
+                text = content
             }
+            guard let audio = Self.linkedAudio(in: text, beside: entry.url, available: audioNames) else { continue }
+            documentsByAudio[audio.standardizedFileURL, default: []].append(entry.url.standardizedFileURL)
         }
-        return url
+        let match = documentsByAudio.first { audio, documents in audio == url || documents.contains(url) }
+        guard let (audio, documents) = match else { return single }
+
+        let files = [audio] + documents
+        let names = files.map(\.lastPathComponent)
+        let visible = try FileManager.default.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil,
+                                                                  options: .skipsHiddenFiles)
+        // 独立录音文件夹可整体移走。混放的项目中只移动实际配对的文件。
+        let dedicated = parent.resolvingSymlinksInPath() != root.resolvingSymlinksInPath()
+            && Set(visible.map(\.lastPathComponent)) == Set(names)
+        return LibraryMovePlan(item: url, sources: dedicated ? [parent] : files, recordings: names)
     }
 
     public nonisolated static func linkedAudio(in text: String, beside document: URL, available: Set<String>? = nil) -> URL? {
-        guard let expression = try? NSRegularExpression(pattern: #"!\[\[([^\]\n]+)\]\]"#) else { return nil }
-        for match in expression.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
-            guard let range = Range(match.range(at: 1), in: text) else { continue }
-            let name = text[range].trimmingCharacters(in: .whitespaces)
-            let url = document.deletingLastPathComponent().appendingPathComponent(name)
-            guard isAudio(url) else { continue }
-            if let available {
-                if available.contains(name) { return url }
-            } else if FileManager.default.fileExists(atPath: url.path) {
-                return url
+        guard text.contains("![[") else { return nil }
+        let parent = document.deletingLastPathComponent()
+        let names = available ?? Set((try? FileManager.default.contentsOfDirectory(atPath: parent.path)) ?? [])
+        var first: (name: String, index: String.Index)?
+        for name in names {
+            let url = parent.appendingPathComponent(name)
+            guard isAudio(url), let match = text.range(of: "![[" + name + "]]", options: .literal) else { continue }
+            if available == nil {
+                guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                      values.isRegularFile == true, values.isSymbolicLink != true else { continue }
             }
+            if let first, match.lowerBound > first.index ||
+                (match.lowerBound == first.index && name.count <= first.name.count) { continue }
+            first = (name, match.lowerBound)
+        }
+        if let first { return parent.appendingPathComponent(first.name) }
+
+        // 兼容旧文稿中链接两端的空格。
+        let expression = #/!\[\[([^\]\n]+)\]\]/#
+        for match in text.matches(of: expression) {
+            let name = match.output.1.trimmingCharacters(in: .whitespaces)
+            let url = parent.appendingPathComponent(name)
+            guard names.contains(name), isAudio(url) else { continue }
+            if available != nil { return url }
+            if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+               values.isRegularFile == true, values.isSymbolicLink != true { return url }
         }
         return nil
     }
 
+    public func move(_ plan: LibraryMovePlan, into directory: URL) throws -> [URL] {
+        guard try movePlan(for: plan.item) == plan else {
+            throw LibraryError.operationFailed("录音关联已改变，请重新确认要移动的文件。")
+        }
+        let destinations = try plan.sources.map { try moveDestination(for: $0, into: directory) }
+        var moved: [(URL, URL)] = []
+        do {
+            for (source, target) in zip(plan.sources, destinations) where source != target {
+                try FileManager.default.moveItem(at: source, to: target)
+                moved.append((source, target))
+            }
+        } catch {
+            var failures: [String] = []
+            for (source, target) in moved.reversed() {
+                do { try FileManager.default.moveItem(at: target, to: source) }
+                catch { failures.append(target.path + " " + error.localizedDescription) }
+            }
+            if !failures.isEmpty { throw LibraryError.rollbackFailed(failures.joined(separator: "\n")) }
+            throw LibraryError.operationFailed("移动失败：\(error.localizedDescription)")
+        }
+        return destinations
+    }
+
     public func move(_ item: URL, into directory: URL) throws -> URL {
+        let src = item.standardizedFileURL
+        let destination = try moveDestination(for: src, into: directory)
+        guard destination != src else { return src }
+        do {
+            try FileManager.default.moveItem(at: src, to: destination)
+        } catch {
+            throw LibraryError.operationFailed("无法移动 \(src.lastPathComponent):\(error.localizedDescription)")
+        }
+        return destination
+    }
+
+    private func moveDestination(for item: URL, into directory: URL) throws -> URL {
         let src = item.standardizedFileURL
         let dir = directory.standardizedFileURL
         try requireInside(src)
         try requireInside(dir)
+        try requireNotSymlink(dir)
+        let resolvedRoot = root.resolvingSymlinksInPath()
+        for path in [src, dir] where !Self.contains(resolvedRoot, path.resolvingSymlinksInPath()) {
+            throw LibraryError.outsideLibrary(path.path)
+        }
         guard src != root else { throw LibraryError.rootNotMutable }
         try requireNotSymlink(src)
         try requireNotProtected(src)
@@ -350,16 +432,11 @@ public actor ProjectLibrary {
         guard !Self.contains(src, dir) else {
             throw LibraryError.operationFailed("不能移动到自身或子文件夹:\(dir.path)")
         }
-        if src.deletingLastPathComponent().standardizedFileURL == dir { return src }
+        if src.deletingLastPathComponent().resolvingSymlinksInPath() == dir.resolvingSymlinksInPath() { return src }
         let kind = try kindOf(src)
         let destination = dir.appendingPathComponent(src.lastPathComponent, isDirectory: kind == .directory)
         if FileManager.default.fileExists(atPath: destination.path) {
             throw LibraryError.nameConflict(destination.lastPathComponent)
-        }
-        do {
-            try FileManager.default.moveItem(at: src, to: destination)
-        } catch {
-            throw LibraryError.operationFailed("无法移动 \(src.lastPathComponent):\(error.localizedDescription)")
         }
         return destination
     }
@@ -431,9 +508,8 @@ public actor ProjectLibrary {
         guard trimmed != "." && trimmed != ".." else { throw LibraryError.invalidName("名称不能是 . 或 ..") }
         guard !trimmed.hasPrefix(".") else { throw LibraryError.invalidName("名称不能以点开头,否则会被当作隐藏文件") }
         guard trimmed.count <= 120 else { throw LibraryError.invalidName("名称不能超过 120 个字符") }
-        let bad = CharacterSet(charactersIn: "/\\:*?\"<>|").union(.newlines).union(.controlCharacters)
-        guard trimmed.rangeOfCharacter(from: bad) == nil else {
-            throw LibraryError.invalidName("名称不能包含 / \\ : * ? \" < > | 或控制字符")
+        guard trimmed.rangeOfCharacter(from: Paths.invalidFileNameCharacters) == nil else {
+            throw LibraryError.invalidName("名称不能包含 / \\ : * ? \" < > | [ ] 或控制字符")
         }
         guard let fileExtension, !fileExtension.isEmpty else { return trimmed }
         let typedExtension = (trimmed as NSString).pathExtension

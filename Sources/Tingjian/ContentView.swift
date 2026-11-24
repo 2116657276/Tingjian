@@ -2,6 +2,11 @@ import AppKit
 import SwiftUI
 import TingjianCore
 
+private func recordingNameParts(_ name: String) -> (course: String, date: String)? {
+    guard let parts = name.wholeMatch(of: #/(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-\d{2}_(.+)/#) else { return nil }
+    return (String(parts.output.4), "\(parts.output.1) \(parts.output.2):\(parts.output.3)")
+}
+
 private enum WorkspaceDragItem: Codable {
     case draft(UUID)
     case file(URL)
@@ -258,11 +263,15 @@ struct ContentView: View {
 
     private func tabTitle(for tab: URL) -> String {
         let base = tab.deletingPathExtension().lastPathComponent
-        let duplicates = model.openTabs.filter { $0.deletingPathExtension().lastPathComponent == base }
-        guard duplicates.count > 1 else { return base }
+        let title = recordingNameParts(base)?.course ?? base
+        let duplicates = model.openTabs.filter { candidate in
+            let name = candidate.deletingPathExtension().lastPathComponent
+            return (recordingNameParts(name)?.course ?? name) == title
+        }
+        guard duplicates.count > 1 else { return title }
         let sameParent = duplicates.filter { $0.deletingLastPathComponent() == tab.deletingLastPathComponent() }
-        if sameParent.count > 1 { return tab.lastPathComponent }
-        return "\(tab.deletingLastPathComponent().lastPathComponent)/\(base)"
+        if sameParent.count > 1 { return title + "." + tab.pathExtension }
+        return "\(title) · \(recordingNameParts(base)?.date ?? tab.deletingLastPathComponent().lastPathComponent)"
     }
 
     private var hasSaveIssue: Bool {
@@ -294,6 +303,7 @@ struct ContentView: View {
                         model.startCorrection(document: document)
                     }
                     .disabled(!model.llmConfigured || model.isCorrecting || rec.isActive)
+                    .help(model.correctionHelp)
                     Divider()
                     Button("重命名…") { model.requestRename(document) }.disabled(rec.isActive)
                     Button("移动到…") { model.requestMove(document) }.disabled(rec.isActive)
@@ -393,7 +403,7 @@ struct ContentView: View {
 
     private var severeBanner: IssueItem? {
         issues.first { $0.remedy == .retrySave || $0.remedy == .recover || $0.remedy == .installModel
-            || $0.id == "persistence" || $0.id == "input" }
+            || $0.id == "persistence" || $0.id == "input" || $0.id == "start" || $0.id == "input-switch" }
     }
 
     private func issueBanner(_ issue: IssueItem) -> some View {
@@ -426,11 +436,11 @@ struct ContentView: View {
     private var content: some View {
         switch model.selection {
         case .currentRecording, .draft:
-            CurrentRecordingView(seekMessage: $model.seekMessage)
+            CurrentRecordingView()
         case .directory(let url):
             DirectoryDetail(url: url)
         case .document(let url):
-            DocumentDetail(url: url, seekMessage: $model.seekMessage)
+            DocumentDetail(url: url)
         case .audio(let url):
             AudioDetail(url: url)
         }
@@ -452,17 +462,26 @@ struct ContentView: View {
             items.append(IssueItem(id: "persistence", title: "文本/恢复信息保存异常",
                                    detail: persistence, path: rec.localDir?.path, tone: .error, remedy: .none))
         }
-        if rec.transcribe == .needsModel {
+        if rec.transcribe == .needsModel || (rec.phase == .finished && rec.speechModelState == .needsDownload) {
             items.append(IssueItem(id: "model", title: "需要简体中文识别模型",
-                                   detail: "录音仍会继续并保存在本地;模型下载完成后会补转最近两分钟。",
+                                   detail: rec.modelDownloadError ?? (rec.isActive ? "录音会继续。模型下载完成后会补转最近两分钟。" : "下载后可在「保存与恢复」中重新转写录音。"),
                                    path: rec.localDir?.path, tone: .warning, remedy: .installModel))
         } else if case .failed(let message) = rec.transcribe {
             items.append(IssueItem(id: "transcribe", title: "语音转写异常",
                                    detail: message, path: rec.localDir?.path, tone: .warning, remedy: .none))
         }
         if let message = rec.message, !message.isEmpty {
-            items.append(IssueItem(id: "message", title: "麦克风或录音提示",
+            items.append(IssueItem(id: rec.phase == .idle ? "start" : "message",
+                                   title: rec.phase == .idle ? "无法开始录音" : "麦克风或录音提示",
                                    detail: message, path: rec.localDir?.path, tone: .error, remedy: .none))
+        }
+        if let inputIssue = rec.inputIssue {
+            items.append(IssueItem(id: "input", title: "录音输入异常",
+                                   detail: inputIssue, path: rec.localDir?.path, tone: .warning, remedy: .none))
+        }
+        if let error = model.inputSwitchError {
+            items.append(IssueItem(id: "input-switch", title: "输入设备切换失败",
+                                   detail: error, path: nil, tone: .error, remedy: .none))
         }
         switch rec.save {
         case .pending(let path, let reason):
@@ -762,6 +781,11 @@ private struct SidebarRow: View {
         }
     }
 
+    private var displayName: String {
+        guard entry.kind == .directory else { return entry.name }
+        return recordingNameParts(entry.name)?.course ?? entry.name
+    }
+
     private var draggableRow: some View {
         HStack(spacing: 4) {
             if entry.kind == .directory {
@@ -785,7 +809,7 @@ private struct SidebarRow: View {
                     .font(.system(size: 11))
                     .foregroundStyle(iconColor)
                     .frame(width: 14)
-                Text(entry.name)
+                Text(displayName)
                     .font(.system(size: 12))
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -800,10 +824,11 @@ private struct SidebarRow: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("\(entry.kind == .directory ? "文件夹" : "文件") \(entry.name)")
+            .accessibilityLabel("\(entry.kind == .directory ? "文件夹" : "文件") \(displayName)")
             .accessibilityAddTraits(selected ? [.isSelected] : [])
         }
         .padding(.leading, CGFloat(depth) * 14 + 8)
+        .help(entry.url.path)
         .contextMenu { menu }
         .onDrag { WorkspaceDragItem.file(entry.url).provider() }
     }
@@ -966,7 +991,7 @@ private struct NewProjectSheet: View {
             TextField("项目名称", text: $model.newProjectDraft)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(commit)
-            Text("项目直接对应磁盘上的文件夹;名称不能包含 / \\ : * ? \" < > |。")
+            Text("项目直接对应磁盘上的文件夹;名称不能包含 / \\ : * ? \" < > | [ ]。")
                 .font(.system(size: 11))
                 .foregroundStyle(TingjianTheme.secondaryInk)
                 .fixedSize(horizontal: false, vertical: true)
@@ -997,7 +1022,6 @@ private struct CurrentRecordingView: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var rec: Recorder
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Binding var seekMessage: String?
 
     private var showsLiveTranscript: Bool {
         guard model.isRecordingSelection else { return false }
@@ -1131,8 +1155,8 @@ private struct CurrentRecordingView: View {
                             .foregroundStyle(TingjianTheme.secondaryInk)
                     }
 
-                    if model.savedInputUnavailable {
-                        Label("保存的输入设备不可用，请先在设置中选择输入设备。", systemImage: "mic.slash")
+                    if model.nextInputUnavailable {
+                        Label("所选输入设备不可用，请在底栏选择可用设备。", systemImage: "mic.slash")
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(TingjianTheme.warning)
                             .padding(.top, 3)
@@ -1266,7 +1290,7 @@ private struct DirectoryDetail: View {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(url.lastPathComponent).font(.system(size: 22, weight: .semibold))
-                        Text(model.isRootDirectory(url) ? "资料库根目录" : (ProjectLibrary.isRecordingBundle(url) ? "录音文件夹" : "项目文件夹"))
+                        Text(model.isRootDirectory(url) ? "资料库根目录" : (model.isRecordingDirectory(url) ? "录音文件夹" : "项目文件夹"))
                             .font(.system(size: 12))
                             .foregroundStyle(TingjianTheme.secondaryInk)
                     }
@@ -1335,7 +1359,11 @@ private struct DirectoryRow: View {
                                   : (entry.kind == .audio ? "waveform" : "doc.text"))
                     .foregroundStyle(entry.kind == .audio ? TingjianTheme.accent : TingjianTheme.secondaryInk)
                     .frame(width: 16)
-                Text(entry.name).font(.system(size: 13))
+                let parts = entry.kind == .directory ? recordingNameParts(entry.name) : nil
+                Text(parts?.course ?? entry.name).font(.system(size: 13))
+                if let parts {
+                    Text(parts.date).font(.system(size: 10)).foregroundStyle(TingjianTheme.secondaryInk)
+                }
                 if model.isRecordingDirectory(entry.url) { Text("录音").font(.system(size: 10)).foregroundStyle(TingjianTheme.record) }
                 Spacer()
                 Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(TingjianTheme.tertiaryInk)
@@ -1374,7 +1402,6 @@ private struct DirectoryRow: View {
 
 private struct DocumentDetail: View {
     let url: URL
-    @Binding var seekMessage: String?
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var rec: Recorder
     @EnvironmentObject private var playback: PlaybackModel
@@ -1422,7 +1449,7 @@ private struct DocumentDetail: View {
                         } else {
                             LazyVStack(alignment: .leading, spacing: 12) {
                                 ForEach(doc.lines) { line in
-                                    DocumentLineRow(line: line, usesGutter: usesGutter, seekMessage: $seekMessage)
+                                    DocumentLineRow(line: line, usesGutter: usesGutter, linkedAudio: doc.linkedAudio)
                                         .id(line.id)
                                 }
                             }
@@ -1516,15 +1543,20 @@ private struct DocumentDetail: View {
 private struct DocumentLineRow: View {
     let line: DocumentLine
     let usesGutter: Bool
-    @Binding var seekMessage: String?
+    let linkedAudio: URL?
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var rec: Recorder
     @EnvironmentObject private var playback: PlaybackModel
 
-    private var seconds: Double? { AppModel.parseTimecode(line.time) }
-    private var playable: Bool {
-        !rec.isActive && playback.currentURL != nil && playback.canSeek
-            && (seconds.map { $0 < playback.duration } ?? false)
+    private var unavailableReason: String? {
+        guard !rec.isActive else { return "录音进行中，结束后可定位回听" }
+        guard let linkedAudio else { return "文稿没有可播放的关联音频" }
+        guard let seconds = AppModel.parseTimecode(line.time) else { return "时间戳无法解析" }
+        if playback.currentURL?.standardizedFileURL == linkedAudio.standardizedFileURL,
+           playback.canSeek, seconds >= playback.duration {
+            return "该时间点超出音频时长"
+        }
+        return nil
     }
 
     var body: some View {
@@ -1543,16 +1575,16 @@ private struct DocumentLineRow: View {
 
     private var timestamp: some View {
         Button {
-            seekMessage = model.seek(toTimecode: line.time)
+            Task { await model.seek(toTimecode: line.time) }
         } label: {
             Text(line.time)
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .monospacedDigit()
-                .foregroundStyle(playable ? TingjianTheme.accent : TingjianTheme.tertiaryInk)
+                .foregroundStyle(unavailableReason == nil ? TingjianTheme.accent : TingjianTheme.tertiaryInk)
         }
         .buttonStyle(.plain)
-        .disabled(!playable)
-        .help(playable ? "从 \(line.time) 定位" : "没有可定位的关联音频")
+        .disabled(unavailableReason != nil)
+        .help(unavailableReason ?? "从 \(line.time) 定位")
         .accessibilityLabel("定位到 \(line.time)")
     }
 
@@ -1651,7 +1683,6 @@ private struct ControlBand: View {
                               duration: rec.duration, active: rec.phase == .recording)
                 LevelMeter(level: rec.level, active: rec.phase == .recording, reduceMotion: reduceMotion)
                     .frame(width: 120)
-                micMenu
                 Spacer(minLength: 8)
                 pauseResumeButton
                 stopButton
@@ -1661,7 +1692,6 @@ private struct ControlBand: View {
                     RecordingTime(label: rec.phase == .paused ? "已暂停" : "录音中",
                                   duration: rec.duration, active: rec.phase == .recording)
                     LevelMeter(level: rec.level, active: rec.phase == .recording, reduceMotion: reduceMotion)
-                    micMenu
                 }
                 HStack(spacing: 10) {
                     Spacer(minLength: 0)
@@ -1670,36 +1700,6 @@ private struct ControlBand: View {
                 }
             }
         }
-    }
-
-    private var micMenu: some View {
-        Menu {
-            Button("系统默认(开始时固定)") { model.selectInput(nil) }
-            Divider()
-            ForEach(model.inputDevices) { device in
-                Button {
-                    model.selectInput(device.id)
-                } label: {
-                    Text((model.audioInputUID == device.id ? "✓ " : "") + device.name + (device.isDefault ? "(系统默认)" : ""))
-                }
-            }
-            if model.inputDevices.isEmpty {
-                Text("没有可用的输入设备")
-            }
-            if model.savedInputUnavailable {
-                Divider()
-                Text("已保存的输入设备不可用")
-            }
-        } label: {
-            Label(rec.isChangingInput ? "正在切换…" : model.activeInputDescription, systemImage: "mic")
-                .font(.system(size: 12))
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .disabled(rec.isChangingInput)
-        .help("切换输入设备;录音中切换会在新设备上继续同一份录音")
-        .accessibilityLabel("输入设备")
-        .accessibilityValue(model.activeInputDescription)
     }
 
     private var pauseResumeButton: some View {
@@ -1829,15 +1829,14 @@ private struct ControlBand: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(TingjianTheme.record)
-            } else if model.savedInputUnavailable {
+            } else if model.nextInputUnavailable {
                 Label("保存的输入设备不可用", systemImage: "mic.slash")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(TingjianTheme.warning)
                 Spacer()
-                SettingsLink {
-                    Text("选择输入设备")
-                }
-                .buttonStyle(.bordered)
+                Text("请在底栏选择可用的输入设备")
+                    .font(.system(size: 12))
+                    .foregroundStyle(TingjianTheme.secondaryInk)
             } else {
                 Label("准备就绪", systemImage: "waveform")
                     .font(.system(size: 12))
@@ -1861,6 +1860,55 @@ private struct IssueItem: Identifiable {
     let path: String?
     let tone: TingjianTone
     let remedy: Remedy
+}
+
+private struct QuickInputMenu: View {
+    @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var rec: Recorder
+
+    var body: some View {
+        Menu {
+            if !rec.isActive {
+                Button {
+                    model.useConfiguredInput()
+                } label: {
+                    option("使用设置中的默认设备", selected: model.isUsingConfiguredInput)
+                }
+            }
+            Button {
+                model.selectQuickInput(nil)
+            } label: {
+                option("系统默认", selected: !rec.isActive && !model.isUsingConfiguredInput && model.quickInputUID == nil)
+            }
+            .disabled(model.inputDevices.isEmpty)
+            ForEach(model.inputDevices) { device in
+                Button {
+                    model.selectQuickInput(device.id)
+                } label: {
+                    option(device.name, selected: (rec.isActive || !model.isUsingConfiguredInput) && model.quickInputUID == device.id)
+                }
+            }
+            if model.inputDevices.isEmpty {
+                Text("没有可用的输入设备")
+            }
+        } label: {
+            Label(rec.isChangingInput ? "正在切换…" : model.quickInputDescription, systemImage: "mic")
+                .font(.system(size: 11))
+                .lineLimit(1)
+        }
+        .menuStyle(.borderlessButton)
+        .frame(maxWidth: 150)
+        .disabled(!model.canSelectQuickInput || AppModel.testAudio != nil)
+        .help(model.inputSwitchError ?? (rec.isActive ? "切换当前录音的输入设备" : "选择下一次录音的输入设备"))
+        .accessibilityLabel("快捷切换输入设备")
+        .accessibilityValue(model.quickInputDescription)
+    }
+
+    @ViewBuilder
+    private func option(_ name: String, selected: Bool) -> some View {
+        if selected { Label(name, systemImage: "checkmark") }
+        else { Text(name) }
+    }
 }
 
 private struct StatusBar: View {
@@ -1888,6 +1936,7 @@ private struct StatusBar: View {
                     .foregroundStyle(TingjianTheme.tertiaryInk)
             }
             Spacer(minLength: 8)
+            QuickInputMenu()
             Button {
                 showIssues = true
             } label: {
@@ -1915,15 +1964,6 @@ private struct StatusBar: View {
         }
     }
 
-    private var recordTone: TingjianTone {
-        switch rec.phase {
-        case .recording: .recording
-        case .starting, .finalizing: .accent
-        case .paused: .warning
-        case .idle, .finished: .neutral
-        }
-    }
-
     private var transcribeText: String {
         switch rec.transcribe {
         case .idle: "待命"
@@ -1939,15 +1979,6 @@ private struct StatusBar: View {
         }
     }
 
-    private var transcribeTone: TingjianTone {
-        switch rec.transcribe {
-        case .running, .done: .accent
-        case .recovering, .finishing, .incomplete, .needsModel: .warning
-        case .unsupported, .failed: .error
-        case .idle, .preparing: .neutral
-        }
-    }
-
     private var saveText: String {
         switch rec.save {
         case .idle: rec.isActive ? "本地持续保存中" : "—"
@@ -1955,14 +1986,6 @@ private struct StatusBar: View {
         case .saved: "已写入目录"
         case .pending: "待保存,本地已保留"
         case .failed: "保存失败"
-        }
-    }
-
-    private var saveTone: TingjianTone {
-        switch rec.save {
-        case .saved, .saving: .accent
-        case .idle: rec.isActive ? .accent : .neutral
-        case .pending, .failed: .error
         }
     }
 }
@@ -2152,23 +2175,6 @@ private struct VolatileRow: View {
     }
 }
 
-private struct StatusToken: View {
-    let title: String
-    let value: String
-    let tone: TingjianTone
-
-    var body: some View {
-        HStack(spacing: 5) {
-            Circle().fill(tone.color).frame(width: 5, height: 5)
-            Text(title).foregroundStyle(TingjianTheme.tertiaryInk)
-            Text(value).foregroundStyle(TingjianTheme.secondaryInk).lineLimit(1)
-        }
-        .font(.system(size: 11))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(title):\(value)")
-    }
-}
-
 private struct RecordingTime: View {
     let label: String
     let duration: Double
@@ -2246,6 +2252,8 @@ private struct InitialSetupView: View {
                     Text(notice).foregroundStyle(TingjianTheme.warning)
                 }
             }
+            Divider()
+            SpeechModelControl()
             Divider()
             Toggle("启用文字纠正", isOn: $model.llmEnabled)
             Text("可在设置中选择网关和纠正方式。")

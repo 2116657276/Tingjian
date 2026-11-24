@@ -1,6 +1,41 @@
 import AVFoundation
 import Foundation
 
+@_spi(Testing) public func drainPCM(_ converter: AVAudioConverter, maxIterations: Int = 64, consume: (AVAudioPCMBuffer) throws -> Void) throws {
+    let limit = max(1, maxIterations)
+    for _ in 0..<limit {
+        guard let output = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: 4096) else {
+            throw EngineError.conversion("无法分配重采样尾部缓冲")
+        }
+        var error: NSError?
+        let status = converter.convert(to: output, error: &error) { _, inputStatus in
+            inputStatus.pointee = .endOfStream
+            return nil
+        }
+        if let error { throw EngineError.conversion(error.localizedDescription) }
+        switch status {
+        case .error:
+            throw EngineError.conversion("重采样尾部转换失败")
+        case .haveData:
+            if output.frameLength > 0 {
+                try consume(output)
+            } else {
+                return
+            }
+        case .inputRanDry, .endOfStream:
+            if output.frameLength > 0 {
+                try consume(output)
+            }
+            return
+        @unknown default:
+            if output.frameLength > 0 {
+                try consume(output)
+            }
+            return
+        }
+    }
+}
+
 /// 最近一段已保存音频,用于转写中断恢复时补喂,避免丢字。
 final class ReplayRing: @unchecked Sendable {
     struct Item { let start: Double; let end: Double; let buffer: AVAudioPCMBuffer }
@@ -56,9 +91,11 @@ final class AudioPipeline: @unchecked Sendable {
     private var engine: TranscriptionEngine?
     private var converter: AVAudioConverter?
     private var converterInput: AVAudioFormat?
+    private let enhancer: SpeechEnhancer
 
-    init(url: URL, sampleRate: Double) throws {
+    init(url: URL, sampleRate: Double, enhancement: SpeechEnhancer.Config) throws {
         fileRate = sampleRate
+        enhancer = SpeechEnhancer(sampleRate: sampleRate, config: enhancement)
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVSampleRateKey: sampleRate,
@@ -101,6 +138,10 @@ final class AudioPipeline: @unchecked Sendable {
     func close() async -> Int64 {
         await withCheckedContinuation { (c: CheckedContinuation<Int64, Never>) in
             queue.async { [self] in
+                if !failed {
+                    do { try flushConverter() }
+                    catch { reportWriteFailure(error) }
+                }
                 file = nil
                 c.resume(returning: savedSamples)
             }
@@ -109,23 +150,38 @@ final class AudioPipeline: @unchecked Sendable {
 
     private func process(_ mono: AVAudioPCMBuffer) {
         guard !failed, file != nil else { return }
-        var buf = mono
-        if mono.format.sampleRate != fileRate {
-            guard let r = resample(mono) else { return }
-            buf = r
-        }
-        updateLevel(buf)
         do {
-            try file?.write(from: buf)
+            if converterInput != mono.format { try flushConverter() }
+            if mono.format.sampleRate == fileRate {
+                try write(mono)
+            } else {
+                try resampleAndWrite(mono)
+            }
         } catch {
-            lock.lock(); _failed = true; lock.unlock()
-            onWriteFailure?("音频无法写入:\(error.localizedDescription)")
-            return
+            reportWriteFailure(error)
         }
+    }
+
+    private func reportWriteFailure(_ error: Error) {
+        lock.lock(); _failed = true; lock.unlock()
+        onWriteFailure?("音频无法写入:\(error.localizedDescription)")
+    }
+
+    private func flushConverter() throws {
+        guard let converter else { return }
+        defer { self.converter = nil; converterInput = nil }
+        try drainPCM(converter, consume: write)
+    }
+
+    private func write(_ buf: AVAudioPCMBuffer) throws {
+        guard let file else { return }
+        try file.write(from: buf)
+        updateLevel(buf)
         let start = savedSeconds
         lock.lock(); _samples += Int64(buf.frameLength); lock.unlock()
-        ring.append(start: start, buffer: buf)
-        engine?.feed(buf, start: start)
+        let enhanced = enhancer.process(buf)
+        ring.append(start: start, buffer: enhanced)
+        engine?.feed(enhanced, start: start)
     }
 
     private func updateLevel(_ b: AVAudioPCMBuffer) {
@@ -139,23 +195,34 @@ final class AudioPipeline: @unchecked Sendable {
     }
 
     /// 输入设备采样率变化后,统一重采样到文件采样率,时间轴继续累加。
-    private func resample(_ b: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        if converter == nil || converterInput != b.format {
-            let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: fileRate, channels: 1, interleaved: false)!
-            converter = AVAudioConverter(from: b.format, to: target)
+    private func resampleAndWrite(_ b: AVAudioPCMBuffer) throws {
+        if converter == nil {
+            guard let target = file?.processingFormat,
+                  let next = AVAudioConverter(from: b.format, to: target) else {
+                throw EngineError.conversion("不支持的录音采样率：\(b.format.sampleRate)")
+            }
+            next.sampleRateConverterQuality = AVAudioQuality.high.rawValue
+            converter = next
             converterInput = b.format
         }
-        guard let converter else { return nil }
+        guard let converter else { throw EngineError.noFormat }
         let ratio = fileRate / b.format.sampleRate
-        let cap = AVAudioFrameCount(Double(b.frameLength) * ratio) + 64
-        guard let out = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: cap) else { return nil }
+        let cap = AVAudioFrameCount(ceil(Double(b.frameLength) * ratio)) + 1024
         var supplied = false
-        var err: NSError?
-        converter.convert(to: out, error: &err) { _, st in
-            if supplied { st.pointee = .noDataNow; return nil }
-            supplied = true; st.pointee = .haveData; return b
+        while true {
+            guard let out = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: cap) else {
+                throw EngineError.conversion("无法分配录音重采样缓冲")
+            }
+            var err: NSError?
+            let status = converter.convert(to: out, error: &err) { _, st in
+                if supplied { st.pointee = .noDataNow; return nil }
+                supplied = true; st.pointee = .haveData; return b
+            }
+            if let err { throw err }
+            if status == .error { throw EngineError.conversion("录音重采样失败") }
+            if out.frameLength > 0 { try write(out) }
+            if status != .haveData || out.frameLength < cap { return }
         }
-        return err == nil && out.frameLength > 0 ? out : nil
     }
 
     static func monoCopy(_ b: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
