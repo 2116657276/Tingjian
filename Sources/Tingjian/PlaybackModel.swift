@@ -28,6 +28,8 @@ private final class PlaybackProgress {
 /// 应用内唯一播放器:切换资源时移除旧观察者,结束时归为暂停。
 @MainActor
 final class PlaybackModel: ObservableObject {
+    static let supportedRates: [Float] = [1.0, 1.25, 1.5, 2.0]
+
     @Published private(set) var currentURL: URL?
     private let progress = PlaybackProgress()
     private(set) var position: Double {
@@ -36,14 +38,30 @@ final class PlaybackModel: ObservableObject {
     }
     @Published private(set) var duration: Double = 0
     @Published private(set) var isPlaying = false
+    @Published var rate: Float {
+        didSet {
+            let normalized = Self.normalizeRate(rate)
+            if normalized != rate {
+                rate = normalized
+                return
+            }
+            defaults.set(Double(normalized), forKey: "playbackRate")
+            if isPlaying { player.rate = normalized }
+        }
+    }
     @Published private(set) var error: String?
+    var onTimeChanged: ((Double) -> Void)?
 
+    private let defaults: UserDefaults
     private let player = AVPlayer()
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var loadGeneration = 0
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let stored = Float(defaults.double(forKey: "playbackRate"))
+        self.rate = stored > 0 ? Self.normalizeRate(stored) : 1.0
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.1, preferredTimescale: 600), queue: .main
         ) { [weak self] time in
@@ -56,8 +74,21 @@ final class PlaybackModel: ObservableObject {
                 guard let self, let item = note.object as? AVPlayerItem, item === self.player.currentItem else { return }
                 self.isPlaying = false
                 self.position = self.duration
+                self.onTimeChanged?(self.position)
             }
         }
+    }
+
+    static func normalizeRate(_ candidate: Float) -> Float {
+        guard candidate.isFinite else { return 1.0 }
+        return supportedRates.min(by: { abs($0 - candidate) < abs($1 - candidate) }) ?? 1.0
+    }
+
+    var rateLabel: String {
+        if abs(rate - Float(Int(rate))) < 0.01 { return "\(Int(rate)).0x" }
+        let hundredths = Int((rate * 100).rounded())
+        if hundredths % 10 == 0 { return String(format: "%.1fx", rate) }
+        return String(format: "%.2fx", rate)
     }
 
     deinit {
@@ -82,11 +113,13 @@ final class PlaybackModel: ObservableObject {
             guard seconds.isFinite, seconds > 0.05 else { throw PlaybackError.invalidDuration }
             guard generation == loadGeneration else { return }
             let item = AVPlayerItem(asset: asset)
+            item.audioTimePitchAlgorithm = .timeDomain
             player.replaceCurrentItem(with: item)
             currentURL = url
             duration = seconds
             position = 0
             isPlaying = false
+            onTimeChanged?(0)
             for _ in 0..<60 {
                 try Task.checkCancellation()
                 if generation != loadGeneration { return }
@@ -109,7 +142,7 @@ final class PlaybackModel: ObservableObject {
     func play() {
         guard currentURL != nil, player.currentItem?.status == .readyToPlay else { return }
         if duration > 0, position >= duration - 0.05 { seek(to: 0) }
-        player.play()
+        player.playImmediately(atRate: rate)
         isPlaying = true
     }
 
@@ -120,6 +153,20 @@ final class PlaybackModel: ObservableObject {
 
     func togglePlay() {
         isPlaying ? pause() : play()
+    }
+
+    func skip(by delta: Double) {
+        guard currentURL != nil, canSeek, delta.isFinite else { return }
+        seek(to: position + delta)
+    }
+
+    func playFrom(_ seconds: Double) {
+        guard currentURL != nil, canSeek else { return }
+        seek(to: seconds)
+        if player.currentItem?.status == .readyToPlay {
+            player.playImmediately(atRate: rate)
+            isPlaying = true
+        }
     }
 
     var displayedPosition: Double { progress.preview ?? position }
@@ -143,6 +190,7 @@ final class PlaybackModel: ObservableObject {
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
                     toleranceBefore: .zero, toleranceAfter: .zero)
         position = target
+        onTimeChanged?(target)
     }
 
     /// 释放播放器与资源;不清除 error,由调用方决定是否展示。
@@ -161,12 +209,16 @@ final class PlaybackModel: ObservableObject {
         duration = 0
         position = 0
         isPlaying = false
+        onTimeChanged?(0)
     }
 
     private func tick(_ time: CMTime) {
         guard player.currentItem != nil else { return }
         let seconds = time.seconds
-        if seconds.isFinite { position = max(0, min(seconds, max(duration, seconds))) }
+        if seconds.isFinite {
+            position = max(0, min(seconds, max(duration, seconds)))
+            onTimeChanged?(position)
+        }
         let playing = player.rate > 0
         if isPlaying != playing { isPlaying = playing }
         if player.currentItem?.status == .failed {

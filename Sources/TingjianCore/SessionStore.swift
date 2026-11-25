@@ -29,6 +29,22 @@ public enum SessionFiles {
     public static let info = "session.json"
     public static let audio = "audio.caf"
     public static let events = "transcript.jsonl"
+    public static let volatile = "volatile.json"
+}
+
+public struct VolatileSnapshot: Codable, Equatable, Sendable {
+    public var start: Double
+    public var text: String
+
+    public init(start: Double, text: String) {
+        self.start = start
+        self.text = text
+    }
+}
+
+public struct VolatileLoadResult: Sendable {
+    public var snapshot: VolatileSnapshot?
+    public var issue: String?
 }
 
 public struct EventLoadResult: Sendable {
@@ -58,6 +74,16 @@ public final class SessionStore {
     public func prepare() throws {
         try rewriteEvents([])
         try save()
+    }
+
+    public func saveVolatile(_ snapshot: VolatileSnapshot) throws {
+        try Self.encoder.encode(snapshot).write(to: dir.appendingPathComponent(SessionFiles.volatile), options: .atomic)
+    }
+
+    public func clearVolatile() {
+        let url = dir.appendingPathComponent(SessionFiles.volatile)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try? saveVolatile(VolatileSnapshot(start: 0, text: ""))
     }
 
     public func append(_ e: TranscriptEvent) throws {
@@ -114,6 +140,24 @@ public final class SessionStore {
             return EventLoadResult(events: events, issues: issues)
         } catch {
             return EventLoadResult(events: [], issues: ["无法读取文本日志:\(error.localizedDescription)"])
+        }
+    }
+
+    public static func loadVolatile(dir: URL) -> VolatileLoadResult {
+        let url = dir.appendingPathComponent(SessionFiles.volatile)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return VolatileLoadResult(snapshot: nil, issue: nil)
+        }
+        do {
+            let data = try Data(contentsOf: url)
+            let snap = try decoder.decode(VolatileSnapshot.self, from: data)
+            let trimmed = snap.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, snap.start.isFinite else {
+                return VolatileLoadResult(snapshot: nil, issue: nil)
+            }
+            return VolatileLoadResult(snapshot: VolatileSnapshot(start: max(0, snap.start), text: trimmed), issue: nil)
+        } catch {
+            return VolatileLoadResult(snapshot: nil, issue: "实时草稿快照损坏，已跳过未确认草稿。")
         }
     }
 

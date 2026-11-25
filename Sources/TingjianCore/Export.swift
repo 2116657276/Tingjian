@@ -91,15 +91,180 @@ public struct MarkdownDoc {
     /// 解析 Markdown 中的 "[HH:MM:SS] 文本" 行(忽略引用块里的不完整标记)。
     public static func parseSegments(_ md: String) -> [(time: String, text: String)] {
         md.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
-            let l = String(line)
-            guard l.hasPrefix("["), l.count >= 10 else { return nil }
-            let chars = Array(l)
-            guard chars[9] == "]", chars[3] == ":", chars[6] == ":",
-                  chars.count == 10 || chars[10].isWhitespace else { return nil }
-            let time = String(chars[1..<9])
-            guard time.allSatisfy({ $0.isNumber || $0 == ":" }) else { return nil }
-            let text = chars.count == 10 ? "" : String(chars[10...]).trimmingCharacters(in: .whitespaces)
-            return (time, text)
+            parseSegmentLine(String(line))
+        }
+    }
+
+    /// 结构化解析转写/校正版 Markdown：保留标题、元信息、转写状态、说明、缺口警示与校正来源，
+    /// 同时兼容纯普通 Markdown（返回空 blocks 与默认元信息）。
+    public static func parseDocument(_ md: String) -> ParsedMarkdownDocument {
+        var doc = ParsedMarkdownDocument()
+        let lines = md.components(separatedBy: .newlines)
+        var section: String? = nil
+
+        for rawLine in lines {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+
+            if line.hasPrefix("## ") {
+                section = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                continue
+            }
+
+            if doc.title == nil, line.hasPrefix("# ") {
+                let value = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                if !value.isEmpty { doc.title = value }
+                continue
+            }
+
+            if let gap = parseGapLine(line) {
+                doc.blocks.append(.gap(start: gap.start, end: gap.end, note: gap.note))
+                continue
+            }
+
+            if let seg = parseSegmentLine(rawLine) {
+                doc.blocks.append(.segment(time: seg.time, text: seg.text))
+                continue
+            }
+
+            if line.hasPrefix(">"), line.contains("文字校正版") {
+                doc.isCorrected = true
+                if doc.correctedModel == nil, let model = parseCorrectedModel(line) {
+                    doc.correctedModel = model
+                }
+                if doc.originalDocumentName == nil, let original = parseOriginalDocumentName(line) {
+                    doc.originalDocumentName = original
+                }
+                continue
+            }
+
+            if section == nil, line.hasPrefix("- ") {
+                let body = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                if let value = extractMetadataValue(body, prefix: "录制日期") {
+                    doc.recordedAt = value
+                } else if let value = extractMetadataValue(body, prefix: "音频时长") {
+                    doc.duration = value
+                } else if let value = extractMetadataValue(body, prefix: "转写引擎") {
+                    doc.engine = value
+                } else if let value = extractMetadataValue(body, prefix: "转写状态") {
+                    doc.statusLabel = value
+                    doc.status = parseTranscriptStatus(value)
+                }
+                continue
+            }
+
+            if section == "说明", line.hasPrefix("- ") {
+                let note = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                if !note.isEmpty { doc.notes.append(note) }
+            }
+        }
+        return doc
+    }
+
+    private static func parseSegmentLine(_ l: String) -> (time: String, text: String)? {
+        guard l.hasPrefix("["), l.count >= 10 else { return nil }
+        let chars = Array(l)
+        guard chars[9] == "]", chars[3] == ":", chars[6] == ":",
+              chars.count == 10 || chars[10].isWhitespace else { return nil }
+        let time = String(chars[1..<9])
+        guard time.allSatisfy({ $0.isNumber || $0 == ":" }) else { return nil }
+        let text = chars.count == 10 ? "" : String(chars[10...]).trimmingCharacters(in: .whitespaces)
+        return (time, text)
+    }
+
+    private static func parseGapLine(_ line: String) -> (start: String, end: String, note: String)? {
+        guard line.hasPrefix(">"),
+              let match = line.firstMatch(of: #/\[(\d{2}:\d{2}:\d{2})\][–—-]\[(\d{2}:\d{2}:\d{2})\](.*)/#) else {
+            return nil
+        }
+        let start = String(match.output.1)
+        let end = String(match.output.2)
+        let note = String(match.output.3).trimmingCharacters(in: .whitespaces)
+        return (start, end, note.isEmpty ? "此区间转写不完整" : note)
+    }
+
+    private static func parseCorrectedModel(_ line: String) -> String? {
+        guard let match = line.firstMatch(of: #/模型[:：]\s*([^)）\n]+)/#) else { return nil }
+        let model = String(match.output.1).trimmingCharacters(in: .whitespaces)
+        return model.isEmpty ? nil : model
+    }
+
+    private static func parseOriginalDocumentName(_ line: String) -> String? {
+        guard let anchor = line.range(of: "原始转写"),
+              let open = line.range(of: "[[", range: anchor.upperBound..<line.endIndex),
+              let close = line.range(of: "]]", options: .backwards, range: open.upperBound..<line.endIndex) else {
+            return nil
+        }
+        let name = String(line[open.upperBound..<close.lowerBound]).trimmingCharacters(in: .whitespaces)
+        return name.isEmpty ? nil : name
+    }
+
+    private static func extractMetadataValue(_ body: String, prefix: String) -> String? {
+        for sep in [":", "："] {
+            let full = prefix + sep
+            if body.hasPrefix(full) {
+                let value = String(body.dropFirst(full.count)).trimmingCharacters(in: .whitespaces)
+                return value.isEmpty ? nil : value
+            }
+        }
+        return nil
+    }
+
+    private static func parseTranscriptStatus(_ label: String) -> TranscriptStatus? {
+        switch label.trimmingCharacters(in: .whitespaces) {
+        case TranscriptStatus.completed.label: return .completed
+        case TranscriptStatus.partial.label: return .partial
+        case TranscriptStatus.failed.label: return .failed
+        default: return nil
+        }
+    }
+}
+
+public enum ParsedDocumentBlock: Equatable, Sendable {
+    case segment(time: String, text: String)
+    case gap(start: String, end: String, note: String)
+}
+
+public struct ParsedMarkdownDocument: Equatable, Sendable {
+    public var title: String?
+    public var recordedAt: String?
+    public var duration: String?
+    public var engine: String?
+    public var status: TranscriptStatus?
+    public var statusLabel: String?
+    public var notes: [String]
+    public var isCorrected: Bool
+    public var correctedModel: String?
+    public var originalDocumentName: String?
+    public var blocks: [ParsedDocumentBlock]
+
+    public init(title: String? = nil, recordedAt: String? = nil, duration: String? = nil,
+                engine: String? = nil, status: TranscriptStatus? = nil, statusLabel: String? = nil,
+                notes: [String] = [], isCorrected: Bool = false, correctedModel: String? = nil,
+                originalDocumentName: String? = nil, blocks: [ParsedDocumentBlock] = []) {
+        self.title = title; self.recordedAt = recordedAt; self.duration = duration
+        self.engine = engine; self.status = status; self.statusLabel = statusLabel
+        self.notes = notes; self.isCorrected = isCorrected; self.correctedModel = correctedModel
+        self.originalDocumentName = originalDocumentName; self.blocks = blocks
+    }
+
+    public var hasTranscriptMetadata: Bool {
+        recordedAt != nil || duration != nil || status != nil || statusLabel != nil || engine != nil || isCorrected
+    }
+
+    public var emptySegmentCount: Int {
+        blocks.reduce(0) { count, block in
+            if case .segment(_, let text) = block, text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return count + 1
+            }
+            return count
+        }
+    }
+
+    public var gapCount: Int {
+        blocks.reduce(0) { count, block in
+            if case .gap = block { return count + 1 }
+            return count
         }
     }
 }

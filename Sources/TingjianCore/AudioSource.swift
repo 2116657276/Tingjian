@@ -1,5 +1,7 @@
 import AVFoundation
+import CoreAudio
 import Foundation
+import IOKit
 
 /// 一个可选的音频输入设备。id 为系统 uniqueID,应用用它固定输入,不修改系统默认设备。
 public struct AudioInputDevice: Identifiable, Hashable, Sendable {
@@ -35,6 +37,100 @@ public enum AudioInputCatalog {
     public static func device(forUID uid: String) -> AudioInputDevice? {
         devices().first { $0.id == uid }
     }
+
+    /// 通过 CoreAudio 查询指定 UID 对应物理设备是否为内置麦克风；查不到时返回 nil（不误判）。
+    public static func isBuiltInDevice(uid: String) -> Bool? {
+        guard let deviceID = coreAudioDeviceID(forUID: uid) else { return nil }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport)
+        guard status == noErr else { return nil }
+        return transport == kAudioDeviceTransportTypeBuiltIn
+    }
+
+    private static func coreAudioDeviceID(forUID targetUID: String) -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize) == noErr,
+              dataSize > 0 else { return nil }
+        let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+        var ids = [AudioDeviceID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize, &ids) == noErr else {
+            return nil
+        }
+        var uidAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        for deviceID in ids {
+            var unmanagedUID: Unmanaged<CFString>?
+            var uidSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+            let status = withUnsafeMutablePointer(to: &unmanagedUID) { ptr in
+                AudioObjectGetPropertyData(deviceID, &uidAddress, 0, nil, &uidSize, ptr)
+            }
+            guard status == noErr, let cfUID = unmanagedUID?.takeRetainedValue() else { continue }
+            if (cfUID as String) == targetUID { return deviceID }
+        }
+        return nil
+    }
+}
+
+/// 硬件录音前置环境抽象：用于识别“Mac 合盖 + 内置麦克风硬件断开”并在测试中注入可控状态。
+public protocol HardwareInputEnvironment: Sendable {
+    /// Mac 是否合盖；无法判定（如台式机或系统属性缺失）返回 nil，降级放行。
+    func isClamshellClosed() -> Bool?
+    /// 当前系统默认音频输入设备 UID。
+    func defaultInputUID() -> String?
+    /// 指定 UID 是否为内置麦克风；无法判定返回 nil。
+    func isBuiltInInput(uid: String) -> Bool?
+}
+
+public struct SystemHardwareInputEnvironment: HardwareInputEnvironment {
+    public init() {}
+
+    public func isClamshellClosed() -> Bool? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard service != IO_OBJECT_NULL else { return nil }
+        defer { IOObjectRelease(service) }
+        guard let property = IORegistryEntryCreateCFProperty(
+            service, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0
+        )?.takeRetainedValue() else {
+            return nil
+        }
+        return property as? Bool
+    }
+
+    public func defaultInputUID() -> String? {
+        AudioInputCatalog.defaultUID
+    }
+
+    public func isBuiltInInput(uid: String) -> Bool? {
+        AudioInputCatalog.isBuiltInDevice(uid: uid)
+    }
+}
+
+public enum HardwareInputGuard {
+    public static let clamshellBuiltInMessage =
+        "Mac 已合盖，内置麦克风已由硬件断开无法收音。请打开屏幕，或在底栏选择耳机或其他外接麦克风。"
+
+    /// 检查给定请求设备（nil 表示系统默认）在当前硬件环境下是否应拦截。
+    /// 仅当明确确认「已合盖」且最终指向「内置麦克风」时返回拦截说明；无法确定时降级返回 nil。
+    public static func blockReason(for requestedUID: String?, environment: HardwareInputEnvironment) -> String? {
+        guard environment.isClamshellClosed() == true else { return nil }
+        guard let effectiveUID = requestedUID ?? environment.defaultInputUID() else { return nil }
+        guard environment.isBuiltInInput(uid: effectiveUID) == true else { return nil }
+        return clamshellBuiltInMessage
+    }
 }
 
 /// 音频输入抽象:麦克风用于真实录音,文件源只用于用合成音频验证管线。
@@ -45,6 +141,8 @@ public protocol AudioSource: AnyObject {
     /// 实际使用的输入设备;文件、合成源为 nil。
     var activeDeviceUID: String? { get }
     var activeDeviceName: String? { get }
+    /// 是否为真实硬件麦克风音源（需要执行合盖+内置麦前置守卫）。文件/合成源默认 false。
+    var requiresHardwareInputGuard: Bool { get }
     func requestAccess() async -> Bool
     /// 准备输入并返回缓冲区格式,此时尚未开始采集。
     func prepare() async throws -> AVAudioFormat
@@ -55,16 +153,22 @@ public protocol AudioSource: AnyObject {
     func stop() async
 }
 
+public extension AudioSource {
+    var requiresHardwareInputGuard: Bool { false }
+}
+
 public enum AudioError: Error, LocalizedError {
     case noInput
     case deviceUnavailable(String)
     case captureFailed(String)
+    case clamshellBuiltInUnavailable(String)
 
     public var errorDescription: String? {
         switch self {
         case .noInput: return "没有可用的音频输入设备"
         case .deviceUnavailable(let name): return "输入设备不可用:\(name)"
         case .captureFailed(let message): return "麦克风采集失败:\(message)"
+        case .clamshellBuiltInUnavailable(let message): return message
         }
     }
 }
@@ -78,6 +182,7 @@ public final class MicrophoneSource: NSObject, AudioSource, AVCaptureAudioDataOu
 
     public private(set) var activeDeviceUID: String?
     public private(set) var activeDeviceName: String?
+    public var requiresHardwareInputGuard: Bool { true }
 
     private let requestedUID: String?
     private var resolvedUID: String?

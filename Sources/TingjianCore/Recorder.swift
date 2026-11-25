@@ -30,11 +30,11 @@ private final class RecordingMeter {
 public final class Recorder: ObservableObject {
     public enum Phase { case idle, starting, recording, paused, finalizing, finished }
 
-    @Published public private(set) var phase: Phase = .idle
-    @Published public private(set) var segments: [Segment] = []
-    @Published public private(set) var volatileText = ""
+    @Published public internal(set) var phase: Phase = .idle
+    @Published public internal(set) var segments: [Segment] = []
+    @Published public internal(set) var volatileText = ""
     private let meter = RecordingMeter()
-    public private(set) var duration: Double {
+    public internal(set) var duration: Double {
         get { meter.duration }
         set { meter.duration = newValue }
     }
@@ -42,24 +42,25 @@ public final class Recorder: ObservableObject {
         get { meter.level }
         set { meter.level = newValue }
     }
-    @Published public private(set) var transcribe: TranscribeState = .idle
-    @Published public private(set) var save: SaveState = .idle
-    @Published public private(set) var message: String?
-    @Published public private(set) var inputIssue: String?
-    @Published public private(set) var deliveredDir: URL?
-    @Published public private(set) var deliveredFiles: DeliveryResult?
+    @Published public internal(set) var transcribe: TranscribeState = .idle
+    @Published public internal(set) var save: SaveState = .idle
+    @Published public internal(set) var message: String?
+    @Published public internal(set) var inputIssue: String?
+    @Published public internal(set) var deliveredDir: URL?
+    @Published public internal(set) var deliveredFiles: DeliveryResult?
     @Published public private(set) var persistenceIssue: String?
-    @Published public private(set) var localDir: URL?
-    @Published public private(set) var speechModelState: ModelState?
-    @Published public private(set) var modelDownloadError: String?
-    @Published public private(set) var modelProgress: Double?
-    @Published public private(set) var finalStatus: TranscriptStatus?
+    @Published public internal(set) var localDir: URL?
+    @Published public internal(set) var speechModelState: ModelState?
+    @Published public internal(set) var modelDownloadError: String?
+    @Published public internal(set) var modelProgress: Double?
+    @Published public internal(set) var finalStatus: TranscriptStatus?
     @Published public private(set) var activeInputUID: String?
     @Published public private(set) var activeInputName: String?
     @Published public private(set) var isChangingInput = false
-    public private(set) var courseName = ""
-    public private(set) var sessionDraftID: UUID?
-    private var sessionPlacement: RecordingPlacement?
+    @Published public internal(set) var courseName = ""
+    @Published public private(set) var silenceWarning: String?
+    public internal(set) var sessionDraftID: UUID?
+    var sessionPlacement: RecordingPlacement?
     /// 交付确认后在主线程同步通知工作区。
     public var onDelivery: ((DeliveryResult, UUID?) -> Void)?
 
@@ -67,39 +68,48 @@ public final class Recorder: ObservableObject {
     public var localRoot: URL
     /// 录音开始时固定输入设备;nil 表示首次准备时解析系统默认。
     public var preferredInputUID: String?
+    public var hardwareEnvironment: HardwareInputEnvironment = SystemHardwareInputEnvironment()
+    /// 连续低电平且无新转写达到该秒数时发出温和静音提示（不中断录音）。
+    public var silenceWarningThreshold: TimeInterval = 45
     public var makeEngine: () -> TranscriptionEngine
     public var makeSource: (String?) -> AudioSource
     public var finishTimeout: TimeInterval = 20
     public var retryDelay: TimeInterval = 2
     @_spi(Testing) public var speechEnhancement = SpeechEnhancer.Config()
 
-    private var source: AudioSource?
-    private var pipeline: AudioPipeline?
-    private var store: SessionStore?
-    private var assembler = TranscriptAssembler()
-    private var engine: TranscriptionEngine?
-    private var engineGen = 0
-    private var engineLive = false
-    private var attempts = 0
-    private var engineTask: Task<Void, Never>?
+    var source: AudioSource?
+    var pipeline: AudioPipeline?
+    var store: SessionStore?
+    var assembler = TranscriptAssembler()
+    var engine: TranscriptionEngine?
+    var engineGen = 0
+    var engineLive = false
+    var attempts = 0
+    var engineTask: Task<Void, Never>?
     private var timer: Timer?
     private var activity: NSObjectProtocol?
     private var tickCount = 0
-    private var notes: [String] = []
-    private var pendingFiles: (base: String, m4a: URL?, md: URL)?
-    private var sleepObservers: [NSObjectProtocol] = []
-    private var stopping = false
+    private var quietTicks = 0
+    var notes: [String] = []
+    var pendingFiles: (base: String, m4a: URL?, md: URL)?
+    var sleepObservers: [NSObjectProtocol] = []
+    var stopping = false
     private var startupGeneration = 0
     private var startupSource: AudioSource?
-    private var sourceGeneration = 0
-    private var inputChain: Task<Void, Never>?
-    private var needsInputRebuild = false
-    private var interruptionRetried = false
-    private var sessionSaveRoot: URL?
+    var sourceGeneration = 0
+    var inputChain: Task<Void, Never>?
+    var needsInputRebuild = false
+    var interruptionRetried = false
+    var sessionSaveRoot: URL?
     private var metadataError: String?
-    private var journalError: String?
-    private var hadPersistenceFailure = false
-    private var engineBoundary = 0.0
+    var journalError: String?
+    var hadPersistenceFailure = false
+    var engineBoundary = 0.0
+    var lastVolatilePersistTime: Date = .distantPast
+    var lastPersistedVolatileText = ""
+    var modelInstallGeneration = 0
+    static let volatilePersistInterval: TimeInterval = 1.2
+    static let timelineEpsilon = 0.0001
     public var deliverFiles: @Sendable (String, URL?, URL, URL, UUID) throws -> DeliveryResult = {
         try Deliverer.deliver(base: $0, audio: $1, markdown: $2, to: $3, id: $4)
     }
@@ -138,6 +148,13 @@ public final class Recorder: ObservableObject {
         let generation = startupGeneration
         courseName = course
         let input = makeSource(preferredInputUID)
+        if input.requiresHardwareInputGuard,
+           let blocked = HardwareInputGuard.blockReason(for: preferredInputUID, environment: hardwareEnvironment) {
+            phase = .idle
+            sessionSaveRoot = nil
+            message = blocked
+            return false
+        }
         startupSource = input
         let granted = await input.requestAccess()
         guard generation == startupGeneration, phase == .starting else { await input.stop(); return false }
@@ -252,12 +269,32 @@ public final class Recorder: ObservableObject {
         guard phase == .recording else { return }
         phase = .paused
         level = 0
+        clearSilenceWarning()
         let current = source
         await runInput { await current?.pause() }
     }
 
+    /// 录音或暂停期间修改/补填课程名：只更新内存与交付用 baseName 并落盘 session.json，
+    /// 不移动正在写入的 localDir，保证音频写入和强退恢复连续不断。
+    public func updateCourseName(_ name: String) {
+        guard phase == .recording || phase == .paused else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed != courseName else { return }
+        courseName = trimmed
+        if let store {
+            store.info.course = trimmed
+            store.info.baseName = Paths.baseName(date: store.info.startedAt, course: trimmed)
+            persistMetadata()
+        }
+    }
+
     public func resume() async {
         guard phase == .paused, !isChangingInput else { return }
+        if let current = source, current.requiresHardwareInputGuard,
+           let blocked = HardwareInputGuard.blockReason(for: activeInputUID ?? preferredInputUID, environment: hardwareEnvironment) {
+            inputIssue = blocked
+            return
+        }
         let rebuild = needsInputRebuild
         needsInputRebuild = false
         interruptionRetried = false
@@ -300,8 +337,13 @@ public final class Recorder: ObservableObject {
             let wasRecording = self.phase == .recording
             let previous = self.source
             let previousName = self.activeInputName
-            await previous?.pause()
             let candidate = self.makeSource(uid)
+            if candidate.requiresHardwareInputGuard,
+               let blocked = HardwareInputGuard.blockReason(for: uid, environment: self.hardwareEnvironment) {
+                failure = AudioError.clamshellBuiltInUnavailable(blocked)
+                return
+            }
+            await previous?.pause()
             self.sourceGeneration += 1
             let generation = self.sourceGeneration
             self.bindCallbacks(to: candidate, generation: generation, pipeline: pipeline)
@@ -372,6 +414,7 @@ public final class Recorder: ObservableObject {
     public func stop() async {
         guard phase == .recording || phase == .paused, !stopping, let store, let pipeline else { return }
         stopping = true
+        clearSilenceWarning()
         phase = .finalizing
         sourceGeneration += 1
         let pendingChain = inputChain
@@ -405,6 +448,7 @@ public final class Recorder: ObservableObject {
         if !engineOK, let engine { Task { await engine.cancel() } }
         // 结束时清空未转正的临时文本,避免界面残留幽灵 volatile
         assembler.clearVolatile()
+        clearVolatileSnapshot()
         // 引擎没有覆盖到的末段标记为不完整,不编造内容
         let uncovered = duration - assembler.lastEnd
         if !engineOK && uncovered > 1 { record(assembler.markGap(start: assembler.lastEnd, end: duration)) }
@@ -417,526 +461,6 @@ public final class Recorder: ObservableObject {
         transcribe = status == .completed ? .done : .incomplete
         await finishSession(store: store, m4a: m4a, duration: duration, status: status)
         stopping = false
-    }
-
-    // MARK: 关闭应用 / 恢复
-
-    /// 供应用退出时调用:同步等待音频落盘并写好 session.json,其余交给下次启动恢复。
-    public func emergencyFlush() async {
-        guard phase == .recording || phase == .paused, let store, let pipeline else { return }
-        sourceGeneration += 1
-        let pendingChain = inputChain
-        await pendingChain?.value
-        let current = source
-        await current?.stop()
-        let samples = await pipeline.close()
-        store.info.savedSamples = samples
-        store.info.notes = notes
-        persistMetadata()
-        do { try store.closeEvents() } catch { notePersistence(error, journal: true) }
-    }
-
-    public static func unfinishedSessions(in root: URL) -> [URL] {
-        let fm = FileManager.default
-        let dirs = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
-        return dirs.filter {
-            guard let i = SessionStore.readInfo(dir: $0) else { return FileManager.default.fileExists(atPath: $0.appendingPathComponent(SessionFiles.audio).path) }
-            return i.state == .recording || i.state == .finalizing || i.state == .pendingSave
-        }.sorted { $0.lastPathComponent < $1.lastPathComponent }
-    }
-
-    /// 从本地会话目录恢复并保存(进程异常退出或保存未完成)。
-    public func recover(dir: URL) async {
-        guard phase == .idle || phase == .finished else { return }
-        switch save {
-        case .pending, .failed:
-            guard localDir?.standardizedFileURL == dir.standardizedFileURL else {
-                message = "上次录音尚未保存，请先重试保存。"
-                return
-            }
-            await retrySave()
-            return
-        default:
-            break
-        }
-        resetForNewSession()
-        let original = SessionStore.readInfo(dir: dir)
-        sessionSaveRoot = original?.sessionDestination ?? original?.deliveryRoot ?? saveRoot
-        sessionDraftID = original?.draftID
-        sessionPlacement = original?.recordingPlacement
-        let date = (try? dir.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
-        var info = original ?? SessionInfo(baseName: dir.lastPathComponent, course: "", startedAt: date, state: .finalizing)
-        phase = .finalizing; localDir = dir; courseName = info.course
-        let store = SessionStore(dir: dir, info: info)
-        self.store = store
-        if let id = info.deliveryID, let root = info.deliveryRoot {
-            do {
-                let placement = sessionPlacement
-                let existing = try await Task.detached {
-                    if let placement {
-                        return try Deliverer.placementPublication(placement, audioName: info.deliveryAudioName,
-                                                                  markdownName: info.baseName + ".md", id: id)
-                    }
-                    return try Deliverer.published(base: info.baseName, audioName: info.deliveryAudioName,
-                                            markdownName: info.baseName + ".md", in: root, id: id)
-                }.value
-                if let existing {
-                    duration = info.durationSeconds
-                    finalStatus = info.status
-                    transcribe = info.status == .completed ? .done : .incomplete
-                    acknowledgeDelivery(existing, store: store)
-                    phase = .finished
-                    return
-                }
-            } catch {
-                // Keep the attempted destination so retry checks the same publication.
-                sessionSaveRoot = root
-            }
-        }
-        let loaded = SessionStore.loadEvents(dir: dir)
-        assembler = TranscriptAssembler(events: loaded.events)
-        notes = info.notes + loaded.issues
-        if original == nil { notes.append("会话信息缺失或损坏，课程、原录制日期及转写状态未知；显示日期取工作目录创建时间，仅作恢复标识。") }
-        var dur = info.durationSeconds
-        if let f = try? AVAudioFile(forReading: store.audioURL) {
-            dur = Double(f.length) / f.processingFormat.sampleRate
-            info.sampleRate = f.processingFormat.sampleRate; info.savedSamples = f.length
-        }
-        store.info = info; duration = dur
-        let uncertain = original == nil || info.state != .pendingSave || !loaded.issues.isEmpty
-        if uncertain {
-            notes.append("录音或文字曾被意外中断或损坏，已保留完整记录；转写可能不完整。")
-            if dur > assembler.lastEnd { record(assembler.markGap(start: assembler.lastEnd, end: dur)) }
-        }
-        publishAssembler()
-        let m4a = await exportAudio(store: store)
-        let hasText = assembler.events.contains { $0.kind == .text }
-        var status = info.status ?? (hasText ? .partial : .failed)
-        if uncertain || assembler.segments.contains(where: \.incomplete) {
-            status = info.status == .failed || !hasText ? .failed : .partial
-        }
-        transcribe = status == .completed ? .done : .incomplete
-        await finishSession(store: store, m4a: m4a, duration: dur, status: status)
-    }
-
-    // MARK: 保存
-
-    private func exportAudio(store: SessionStore) async -> URL? {
-        let m4a = store.dir.appendingPathComponent(store.info.baseName + ".m4a")
-        do {
-            _ = try await AudioExporter.exportM4A(from: store.audioURL, to: m4a)
-            return m4a
-        } catch {
-            notes.append("M4A 转换失败(\(error.localizedDescription)),原始录音保留为 audio.caf。")
-            if FileManager.default.fileExists(atPath: m4a.path) { try? FileManager.default.trashItem(at: m4a, resultingItemURL: nil) }
-            return nil
-        }
-    }
-
-    private func finishSession(store: SessionStore, m4a: URL?, duration: Double, status: TranscriptStatus) async {
-        attemptPersistence(forceJournal: true)
-        let status = journalError != nil && status == .completed ? TranscriptStatus.partial : status
-        finalStatus = status
-        transcribe = status == .completed ? .done : .incomplete
-        if hadPersistenceFailure {
-            let note = persistenceIssue == nil ? "录制期间曾有文本或恢复信息保存异常，结束时已重新保存。" : "本地文本或恢复信息仍未完整保存:\(persistenceIssue!)"
-            if !notes.contains(note) { notes.append(note) }
-        }
-        if assembler.segments.contains(where: \.incomplete) && !notes.contains(where: { $0.contains("不完整") }) {
-            notes.append("部分时间段的转写不完整,已在正文中标注。")
-        }
-        let engineName = engine?.name ?? SpeechEngine().name
-        let lang = engine?.languageTag ?? "zh-CN"
-        let title = store.info.course.isEmpty ? "课堂录音" : store.info.course
-        let audioName = (m4a ?? store.audioURL).lastPathComponent
-        let doc = MarkdownDoc(title: title, date: store.info.startedAt, duration: duration, audioName: audioName,
-                              engine: engineName, language: lang, status: status, notes: notes,
-                              segments: assembler.segments)
-        let md = store.dir.appendingPathComponent(store.info.baseName + ".md")
-        do { try doc.render().write(to: md, atomically: true, encoding: .utf8) }
-        catch { save = .failed("无法写入 Markdown:\(error.localizedDescription)。本地文件:\(store.dir.path)"); phase = .finished; return }
-        store.info.status = status; store.info.notes = notes
-        pendingFiles = (store.info.baseName, m4a ?? store.audioURL, md)
-        await deliver(store: store)
-        phase = .finished
-    }
-
-    public func retrySave(in newParent: URL? = nil) async {
-        guard let store, phase == .finished else { return }
-        switch save { case .pending, .failed: break; default: return }
-        phase = .finalizing
-        if let newParent {
-            let oldInfo = store.info
-            let oldPlacement = sessionPlacement
-            if let id = oldInfo.deliveryID, let root = oldInfo.deliveryRoot {
-                do {
-                    let previous = try await Task.detached {
-                        if let oldPlacement {
-                            return try Deliverer.placementPublication(oldPlacement, audioName: oldInfo.deliveryAudioName,
-                                                                      markdownName: oldInfo.baseName + ".md", id: id)
-                        }
-                        return try Deliverer.published(base: oldInfo.baseName, audioName: oldInfo.deliveryAudioName,
-                                                       markdownName: oldInfo.baseName + ".md", in: root, id: id)
-                    }.value
-                    if let previous {
-                        acknowledgeDelivery(previous, store: store)
-                        phase = .finished
-                        return
-                    }
-                } catch {
-                    // A missing/replaced or incomplete target can be left behind after explicit reselection.
-                }
-            }
-            store.info.sessionDestination = newParent
-            store.info.recordingPlacement = nil
-            store.info.deliveryID = nil
-            store.info.deliveryRoot = nil
-            do { try store.save() }
-            catch {
-                store.info = oldInfo
-                save = .pending(store.dir.path, error.localizedDescription)
-                phase = .finished
-                return
-            }
-            sessionSaveRoot = newParent
-            sessionPlacement = nil
-        }
-        if pendingFiles == nil {
-            let audio = store.dir.appendingPathComponent(store.info.baseName + ".m4a")
-            await finishSession(store: store, m4a: FileManager.default.fileExists(atPath: audio.path) ? audio : nil,
-                                duration: duration, status: finalStatus ?? .partial)
-        } else {
-            attemptPersistence(forceJournal: true)
-            await deliver(store: store)
-            phase = .finished
-        }
-    }
-
-    private func deliver(store: SessionStore) async {
-        guard let f = pendingFiles else { return }
-        save = .saving
-        let destination = sessionDestination
-        let operation = deliverFiles
-        let placement = sessionPlacement
-        do {
-            let id = store.info.deliveryID ?? UUID()
-            store.info.deliveryID = id
-            store.info.deliveryRoot = destination
-            store.info.deliveryAudioName = f.m4a?.lastPathComponent
-            store.info.state = .pendingSave
-            try store.save()
-            let result = try await Task.detached {
-                if let placement {
-                    return try Deliverer.fill(placement, audio: f.m4a, markdown: f.md, id: id)
-                }
-                return try operation(f.base, f.m4a, f.md, destination, id)
-            }.value
-            acknowledgeDelivery(result, store: store)
-        } catch {
-            store.info.state = .pendingSave
-            persistMetadata()
-            save = .pending(store.dir.path, error.localizedDescription)
-        }
-    }
-
-    private func acknowledgeDelivery(_ result: DeliveryResult, store: SessionStore) {
-        deliveredFiles = result
-        deliveredDir = result.directory
-        store.info.destination = result.directory.path
-        store.info.state = .saved
-        persistMetadata()
-        save = .saved(result.directory.path)
-        onDelivery?(result, sessionDraftID)
-    }
-
-    // MARK: 识别引擎
-
-    private func startEngine(replayFrom: Double) {
-        engineGen += 1
-        let gen = engineGen
-        transcribe = attempts == 0 ? .preparing : .recovering(attempts)
-        let eng = makeEngine()
-        engine = eng
-        engineLive = false
-        engineTask = Task { [weak self] in
-            let state = await eng.modelState()
-            guard self?.engineGen == gen else { return }
-            if self?.modelProgress == nil { self?.speechModelState = state }
-            switch state {
-            case .unsupported: self?.engineUnavailable(gen, .unsupported); return
-            case .needsDownload: self?.engineUnavailable(gen, .needsModel); return
-            case .ready: break
-            }
-            let cb = EngineCallbacks(
-                volatile: { [weak self] t, s in self?.onVolatile(gen, t, s) },
-                final: { [weak self] s, e, t in self?.onFinal(gen, s, e, t) },
-                failure: { [weak self] err in self?.onEngineFailure(gen, err) })
-            do {
-                try await eng.start(callbacks: cb)
-                await self?.attachEngine(eng, gen: gen, replayFrom: replayFrom)
-            } catch {
-                self?.onEngineFailure(gen, error)
-            }
-        }
-    }
-
-    private func attachEngine(_ eng: TranscriptionEngine, gen: Int, replayFrom: Double) async {
-        guard gen == engineGen, !stopping, phase == .recording || phase == .paused, let pipeline else { Task { await eng.cancel() }; return }
-        var from = replayFrom
-        if let first = pipeline.ring.firstStart, first > from + 0.5 {
-            // 缓存已不足以补回,这一段如实标记
-            record(assembler.markGap(start: from, end: first)); publishAssembler()
-            from = first
-        }
-        engineBoundary = from
-        engineLive = true
-        transcribe = .running
-        pipeline.attach(eng, replayFrom: from)
-    }
-
-    private func engineUnavailable(_ gen: Int, _ s: TranscribeState) {
-        guard gen == engineGen else { return }
-        transcribe = s
-        if s == .unsupported { message = "本机不支持中文识别。录音继续。" }
-    }
-
-    private var modelInstallGeneration = 0
-
-    public func refreshSpeechModelState() async {
-        guard modelProgress == nil else { return }
-        let generation = modelInstallGeneration
-        let state = await makeEngine().modelState()
-        guard modelProgress == nil, generation == modelInstallGeneration else { return }
-        speechModelState = state
-    }
-
-    public func installModel() async {
-        guard modelProgress == nil else { return }
-        let installer = makeEngine()
-        modelInstallGeneration += 1
-        modelProgress = 0
-        modelDownloadError = nil
-        defer { modelProgress = nil }
-        do {
-            try await installer.installModel { [weak self] progress in
-                Task { @MainActor in
-                    if self?.modelProgress != nil { self?.modelProgress = progress }
-                }
-            }
-            let state = await installer.modelState()
-            speechModelState = state
-            guard state == .ready else { throw EngineError.modelMissing }
-            if transcribe == .needsModel || transcribe == .preparing,
-               phase == .recording || phase == .paused {
-                engineTask?.cancel()
-                startEngine(replayFrom: assembler.lastEnd)
-            }
-        } catch {
-            modelDownloadError = "模型下载失败：\(error.localizedDescription)"
-        }
-    }
-
-    private static let timelineEpsilon = 0.0001
-
-    private func onVolatile(_ gen: Int, _ text: String, _ start: Double) {
-        guard gen == engineGen, start.isFinite else { return }
-        let boundary = max(engineBoundary, assembler.lastEnd)
-        // 允许弱音/气口声学重切分带来的轻微回退,但过滤明显早于已提交/恢复边界的迟到旧结果
-        guard start + 0.25 >= boundary else { return }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let clampedStart = max(start, boundary)
-        guard assembler.canUpdateVolatile(at: clampedStart + Self.timelineEpsilon) else { return }
-        let isRollback = start + Self.timelineEpsilon < boundary
-        if trimmed.isEmpty {
-            assembler.clearVolatile()
-            volatileText = assembler.volatileText
-            return
-        }
-        if isRollback {
-            guard let display = assembler.resolveOverlappingVolatile(text: trimmed, start: start) else {
-                assembler.clearVolatileIfNotAfter(boundary + Self.timelineEpsilon)
-                volatileText = assembler.volatileText
-                return
-            }
-            assembler.setVolatile(display, start: clampedStart)
-        } else {
-            assembler.setVolatile(trimmed, start: clampedStart)
-        }
-        if volatileText != assembler.volatileText { volatileText = assembler.volatileText }
-    }
-
-    private func onFinal(_ gen: Int, _ start: Double, _ end: Double, _ text: String) {
-        guard gen == engineGen, start.isFinite, end.isFinite else { return }
-        let boundary = max(engineBoundary, assembler.lastEnd)
-        // 完全落于已提交边界之前的旧结果(如故障重启后的历史重复补喂)直接忽略
-        guard end > boundary + Self.timelineEpsilon else { return }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let effectiveText: String
-        // 仅在时间戳回退重叠时做去重/前缀剥离;无时间重叠的真实复述不做去重
-        if start + Self.timelineEpsilon < boundary {
-            guard let resolved = assembler.resolveOverlappingFinal(text: trimmed, start: start, end: end, boundary: boundary) else {
-                return
-            }
-            effectiveText = resolved
-        } else {
-            effectiveText = trimmed
-        }
-        // 正常流式识别中弱音/气口重切分导致的轻微时间戳重叠:钳位起始时间并保留有效文字,不误标 gap
-        let clampedStart = max(start, boundary)
-        attempts = 0
-        record(assembler.commit(start: clampedStart, end: end, text: effectiveText))
-        publishAssembler()
-        pipeline?.ring.trim(before: assembler.lastEnd)
-    }
-
-    private func onEngineFailure(_ gen: Int, _ error: Error) {
-        guard gen == engineGen, !stopping else { return }
-        engineLive = false
-        pipeline?.attach(nil, replayFrom: nil)
-        let old = engine
-        Task { await old?.cancel() }
-        assembler.clearVolatile()
-        publishAssembler()
-        attempts += 1
-        guard attempts <= 3, phase == .recording || phase == .paused else {
-            transcribe = .failed(error.localizedDescription)
-            message = "录音继续,转写异常:\(error.localizedDescription)"
-            return
-        }
-        transcribe = .recovering(attempts)
-        let wait = retryDelay * Double(attempts)
-        let from = assembler.lastEnd
-        engineGen += 1  // 使旧引擎的迟到回调失效
-        let gen2 = engineGen
-        Task { [weak self] in
-            try? await Task.sleep(for: .seconds(wait))
-            guard let self, self.engineGen == gen2, !self.stopping, self.phase == .recording || self.phase == .paused else { return }
-            self.startEngine(replayFrom: from)
-        }
-    }
-
-    private func record(_ e: TranscriptEvent?) {
-        guard let e, let store else { return }
-        do { try store.append(e) }
-        catch { notePersistence(error, journal: true) }
-    }
-
-    private func publishAssembler() {
-        segments = assembler.segments
-        volatileText = assembler.volatileText
-    }
-
-    // MARK: 输入设备
-
-    private func bindCallbacks(to input: AudioSource, generation: Int, pipeline: AudioPipeline) {
-        input.onBuffer = { [pipeline] b in pipeline.accept(b) }
-        input.onInterruption = { [weak self] msg in
-            Task { @MainActor in self?.handleInterruption(msg, generation: generation) }
-        }
-        input.onEnd = { [weak self] in
-            Task { @MainActor in self?.handleEnd(generation: generation) }
-        }
-    }
-
-    private func runInput(_ operation: @escaping @MainActor () async -> Void) async {
-        let previous = inputChain
-        let task = Task { @MainActor in
-            await previous?.value
-            await operation()
-        }
-        inputChain = task
-        await task.value
-    }
-
-    private func handleEnd(generation: Int) {
-        guard generation == sourceGeneration else { return }
-        Task { await self.stop() }
-    }
-
-    private func handleInterruption(_ reason: String, generation: Int) {
-        guard generation == sourceGeneration, !stopping,
-              phase == .recording || phase == .paused else { return }
-        if let uid = activeInputUID, AudioInputCatalog.device(forUID: uid) == nil {
-            Task { await self.pauseForMissingInput(reason) }
-            return
-        }
-        if phase == .paused {
-            needsInputRebuild = true
-            inputIssue = "\(reason)。录音已暂停,继续前会重新打开输入设备。"
-            return
-        }
-        Task { await self.recoverInput(reason: reason, generation: generation) }
-    }
-
-    private func pauseForMissingInput(_ reason: String) async {
-        guard phase == .recording else { return }
-        await pause()
-        needsInputRebuild = true
-        inputIssue = "\(reason)。请选择可用的输入设备或结束保存;已录部分保留。"
-        addNote("\(reason),录音暂停。")
-    }
-
-    /// 运行时错误只尝试同 UID 重建一次,失败即暂停,不无限重试、不自动换设备。
-    private func recoverInput(reason: String, generation: Int) async {
-        guard phase == .recording, sourceGeneration == generation, !stopping else { return }
-        guard !interruptionRetried else {
-            await pause()
-            needsInputRebuild = true
-            inputIssue = "\(reason)。录音已暂停,请选择输入设备或结束保存。"
-            return
-        }
-        interruptionRetried = true
-        var failure: String?
-        let current = source
-        await runInput {
-            guard self.phase == .recording, self.sourceGeneration == generation else { return }
-            do { try await current?.restart() }
-            catch { failure = error.localizedDescription }
-        }
-        if let failure {
-            await pause()
-            needsInputRebuild = true
-            inputIssue = "麦克风不可用,请选择输入设备或结束保存。\(failure)"
-            addNote("\(reason),无法自动恢复录音:\(failure)。录音已暂停。")
-        } else if phase == .recording {
-            addNote("\(reason),已自动恢复录音。")
-        }
-    }
-
-    private func handleWriteFailure(_ msg: String) {
-        failStop(msg)
-    }
-
-    /// 无法继续录音:明确提示并安全结束,保留已保存部分。
-    private func failStop(_ msg: String) {
-        guard phase == .recording || phase == .paused else { return }
-        message = "录音已中止:\(msg)"
-        addNote("录音在 \(Timecode.string(duration)) 处中止:\(msg)")
-        Task { await self.stop() }
-    }
-
-    private func addNote(_ n: String) {
-        notes.append("[\(Timecode.string(duration))] \(n)")
-        store?.info.notes = notes
-    }
-
-    private func observeSleep() {
-        let c = NSWorkspace.shared.notificationCenter
-        sleepObservers = [
-            c.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in
-                    guard let self, self.phase == .recording else { return }
-                    self.addNote("系统进入睡眠,睡眠期间没有录音。")
-                }
-            },
-            c.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in
-                    guard let self, self.phase == .recording else { return }
-                    self.handleInterruption("系统从睡眠中唤醒", generation: self.sourceGeneration)
-                }
-            },
-        ]
     }
 
     // MARK: 计时与状态
@@ -964,6 +488,19 @@ public final class Recorder: ObservableObject {
         duration = pipeline.savedSeconds
         let raw = pipeline.takeLevel()
         level = phase == .recording ? max(raw, level * 0.85) : 0
+        if phase == .recording {
+            if raw >= 0.015 || level >= 0.015 {
+                clearSilenceWarning()
+            } else {
+                quietTicks += 1
+                let threshold = max(0.2, silenceWarningThreshold)
+                if silenceWarning == nil, Double(quietTicks) * 0.1 >= threshold {
+                    silenceWarning = "持续未检测到有效输入声音，请检查麦克风是否静音或设备是否正确。"
+                }
+            }
+        } else {
+            clearSilenceWarning()
+        }
         tickCount += 1
         if tickCount % 50 == 0 {
             store.info.savedSamples = pipeline.savedSamples
@@ -972,7 +509,12 @@ public final class Recorder: ObservableObject {
         }
     }
 
-    private func notePersistence(_ error: Error, journal: Bool) {
+    func clearSilenceWarning() {
+        quietTicks = 0
+        if silenceWarning != nil { silenceWarning = nil }
+    }
+
+    func notePersistence(_ error: Error, journal: Bool) {
         hadPersistenceFailure = true
         if journal { journalError = error.localizedDescription } else { metadataError = error.localizedDescription }
         refreshPersistenceIssue()
@@ -983,13 +525,13 @@ public final class Recorder: ObservableObject {
         persistenceIssue = problems.isEmpty ? nil : problems.joined(separator: "；") + "。本地路径: \(store?.dir.path ?? "")"
     }
 
-    private func persistMetadata() {
+    func persistMetadata() {
         guard let store else { return }
         do { try store.save(); metadataError = nil; refreshPersistenceIssue() }
         catch { notePersistence(error, journal: false) }
     }
 
-    private func attemptPersistence(forceJournal: Bool = false) {
+    func attemptPersistence(forceJournal: Bool = false) {
         guard let store else { return }
         if forceJournal || store.journalNeedsRepair || journalError != nil {
             do { try store.rewriteEvents(assembler.events); journalError = nil; refreshPersistenceIssue() }
@@ -999,14 +541,15 @@ public final class Recorder: ObservableObject {
         persistMetadata()
     }
 
-    private func resetForNewSession() {
+    func resetForNewSession() {
         segments = []; volatileText = ""; duration = 0; level = 0
         stopTicking()
         transcribe = .idle; save = .idle; message = nil; deliveredDir = nil; deliveredFiles = nil; localDir = nil
-        finalStatus = nil; inputIssue = nil
+        finalStatus = nil; inputIssue = nil; silenceWarning = nil; quietTicks = 0
         assembler = TranscriptAssembler(); notes = []; attempts = 0; stopping = false
         engine = nil; engineLive = false; pendingFiles = nil
         metadataError = nil; journalError = nil; persistenceIssue = nil; hadPersistenceFailure = false; engineBoundary = 0; tickCount = 0
+        lastVolatilePersistTime = .distantPast; lastPersistedVolatileText = ""
         sessionSaveRoot = nil
         sessionDraftID = nil
         sessionPlacement = nil

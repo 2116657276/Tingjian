@@ -5,22 +5,7 @@ import TingjianCore
 // 验证工具:合成音频 + 故障注入 + 真实识别。不打开麦克风。
 
 let skipCorrection = CommandLine.arguments.contains("--skip-correction")
-private let failureCounter = TestCounter()
-var failures: Int { failureCounter.count }
-func check(_ name: String, _ cond: @autoclosure () async -> Bool, _ detail: String = "") async {
-    if await cond() { print("  ✓ \(name)") } else { failureCounter.increment(); print("  ✗ \(name) \(detail)") }
-}
-func section(_ s: String) { print("\n[\(s)]") }
-
-let tmp = ProcessInfo.processInfo.environment["TINGJIAN_CHECK_ROOT"].map { URL(fileURLWithPath: $0, isDirectory: true) } ?? URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("tingjian-check", isDirectory: true)
-func fresh(_ name: String) -> URL {
-    let u = tmp.appendingPathComponent(name, isDirectory: true)
-    if FileManager.default.fileExists(atPath: u.path) {
-        try! FileManager.default.trashItem(at: u, resultingItemURL: nil)
-    }
-    try! FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
-    return u
-}
+let runStartedAt = ContinuousClock.now
 
 if CommandLine.arguments.contains("--trash-smoke") {
     do {
@@ -49,43 +34,37 @@ if CommandLine.arguments.contains("--trash-smoke") {
 if CommandLine.arguments.contains("--recording-target-only") {
     try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     await saveRootSnapshotChecks()
-    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
-    exit(failures == 0 ? 0 : 1)
+    finishAndExit(startedAt: runStartedAt)
 }
 
 if CommandLine.arguments.contains("--placement-only") {
     try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     await recordingPlacementChecks()
-    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
-    exit(failures == 0 ? 0 : 1)
+    finishAndExit(startedAt: runStartedAt)
 }
 
 if CommandLine.arguments.contains("--correction-only") {
     try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     await continuousCorrectionChecks()
-    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
-    exit(failures == 0 ? 0 : 1)
+    finishAndExit(startedAt: runStartedAt)
 }
 
 if CommandLine.arguments.contains("--weak-voice-bench") || CommandLine.arguments.contains("--weak-voice-holdout") {
     try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     await runWeakVoiceBenchmark(holdout: CommandLine.arguments.contains("--weak-voice-holdout"))
-    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
-    exit(failures == 0 ? 0 : 1)
+    finishAndExit(startedAt: runStartedAt)
 }
 
 if CommandLine.arguments.contains("--audio-regressions-only") {
     try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     await reviewRegressionChecks(includeRecognition: false)
-    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
-    exit(failures == 0 ? 0 : 1)
+    finishAndExit(startedAt: runStartedAt)
 }
 
 if CommandLine.arguments.contains("--long-only") {
     try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     await longRecordingCheck()
-    print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
-    exit(failures == 0 ? 0 : 1)
+    finishAndExit(startedAt: runStartedAt)
 }
 
 @MainActor
@@ -116,17 +95,6 @@ func longRecordingCheck() async {
     let m4aSecs = m4a == nil ? -1 : ((try? await AVURLAsset(url: m4a!).load(.duration).seconds) ?? -1)
     await check("M4A 时长与落盘偏差 <1 秒", abs(m4aSecs - caf) < 1, "\(m4aSecs)")
     await check("内存峰值增量 <400 MB(不随时长无限增长)", peak - m0 < 400, "\(peak - m0)")
-}
-
-/// 生成 24k 单声道测试音(非语音),用于不依赖识别的链路测试。
-func makeTone(_ url: URL, seconds: Double) {
-    let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24000, channels: 1, interleaved: false)!
-    let f = try! AVAudioFile(forWriting: url, settings: fmt.settings)
-    let n = AVAudioFrameCount(seconds * 24000)
-    let b = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: n)!
-    b.frameLength = n
-    for i in 0..<Int(n) { b.floatChannelData![0][i] = 0.3 * sin(Float(i) * 2 * .pi * 440 / 24000) }
-    try! f.write(from: b)
 }
 
 // MARK: 模拟引擎
@@ -187,18 +155,6 @@ final class MockEngine: TranscriptionEngine, @unchecked Sendable {
         return !d
     }
     func cancel() async { lock.withLock { dead = true } }
-}
-
-@MainActor
-func waitUntil(_ timeout: Double, _ cond: () -> Bool) async -> Bool {
-    let end = Date().addingTimeInterval(timeout)
-    while Date() < end { if cond() { return true }; try? await Task.sleep(for: .milliseconds(50)) }
-    return cond()
-}
-
-func audioSeconds(_ url: URL) -> Double {
-    guard let f = try? AVAudioFile(forReading: url) else { return -1 }
-    return Double(f.length) / f.processingFormat.sampleRate
 }
 
 @MainActor
@@ -304,56 +260,20 @@ do {
 }
 
 // MARK: 3 LLM
-final class MockURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var handler: ((URLRequest, Data) -> (Int, Data))?
-    nonisolated(unsafe) static var requests = 0
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-    override func startLoading() {
-        Self.requests += 1
-        var body = request.httpBody ?? Data()
-        if body.isEmpty, let s = request.httpBodyStream {
-            s.open(); var buf = [UInt8](repeating: 0, count: 65536)
-            while s.hasBytesAvailable { let n = s.read(&buf, maxLength: buf.count); if n <= 0 { break }; body.append(buf, count: n) }
-            s.close()
-        }
-        let (code, data) = Self.handler!(request, body)
-        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: code, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: data); client?.urlProtocolDidFinishLoading(self)
-    }
-    override func stopLoading() {}
-}
 if !skipCorrection {
 section("LLM 纠正(模拟服务)")
 do {
-    let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [MockURLProtocol.self]
-    let sess = URLSession(configuration: cfg)
+    let sess = MockLLMFixture.session()
     let segs = (1...6).map { (time: "00:00:0\($0)", text: "原文\($0)") }
     let one = [(time: "00:00:01", text: "计算机网络的食盐")]
 
-    func reply(_ items: [[String: Any]]) -> Data {
-        let content = String(data: try! JSONSerialization.data(withJSONObject: ["items": items]), encoding: .utf8)!
-        return try! JSONSerialization.data(withJSONObject: ["choices": [["message": ["content": content]]]])
-    }
+    func reply(_ items: [[String: Any]]) -> Data { MockLLMFixture.itemsReply(items) }
     func response(_ content: Any, finish: String? = nil, refusal: String? = nil,
                   usage: [String: Any]? = nil) -> Data {
-        var message: [String: Any] = ["content": content]
-        if let refusal { message["refusal"] = refusal }
-        var choice: [String: Any] = ["message": message]
-        if let finish { choice["finish_reason"] = finish }
-        var result: [String: Any] = ["choices": [choice]]
-        if let usage { result["usage"] = usage }
-        return try! JSONSerialization.data(withJSONObject: result)
+        MockLLMFixture.chatResponse(content, finish: finish, refusal: refusal, usage: usage)
     }
-    func items(_ body: Data) -> [[String: Any]] {
-        let obj = try! JSONSerialization.jsonObject(with: body) as! [String: Any]
-        let msgs = obj["messages"] as! [[String: String]]
-        let env = try! JSONSerialization.jsonObject(with: Data(msgs[1]["content"]!.utf8)) as! [String: Any]
-        return env["items"] as! [[String: Any]]
-    }
-    func envelope(_ text: String) -> String {
-        String(data: try! JSONSerialization.data(withJSONObject: ["items": [["id": 1, "text": text]]]), encoding: .utf8)!
-    }
+    func items(_ body: Data) -> [[String: Any]] { MockLLMFixture.requestItems(body) }
+    func envelope(_ text: String) -> String { MockLLMFixture.singleItemEnvelope(text) }
     var lastAuth: String?, lastURL: String?
     var sawAdjacentContext = false
     func upper(_ req: URLRequest, _ body: Data) -> (Int, Data) {
@@ -581,8 +501,7 @@ do {
 // MARK: 3b 网关清单与参数
 section("网关模型清单与请求参数(模拟)")
 do {
-    let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [MockURLProtocol.self]
-    let sess = URLSession(configuration: cfg)
+    let sess = MockLLMFixture.session()
     MockURLProtocol.handler = { _, _ in
         (200, Data(#"{"data":[{"id":"a/b","display_name":"A","reasoning_levels":["low","high","max"],"native_endpoints":["/v1/chat/completions"]},{"id":"c/d","display_name":"C","reasoning_levels":["low","medium"],"native_endpoints":["/v1/responses"]},{"id":"e","display_name":"E"}]}"#.utf8))
     }
@@ -591,13 +510,9 @@ do {
     await check("仅 responses 的模型标记为不支持纠正", ms[0].supportsChat && !ms[1].supportsChat && ms[2].supportsChat)
     await check("默认强度取最低档", ms[0].defaultLevel == "low" && ms[1].defaultLevel == "low")
     MockURLProtocol.handler = { _, body in
-        let captured = (try? JSONSerialization.jsonObject(with: body) as? [String: Any]) ?? [:]
-        let msgs = captured["messages"] as! [[String: String]]
-        let items = try! JSONSerialization.jsonObject(with: Data(msgs[1]["content"]!.utf8)) as! [String: Any]
-        let out = items["items"] as! [[String: Any]]
-        let content = String(data: try! JSONSerialization.data(withJSONObject: ["items": out.map { ["id": $0["id"]!, "text": $0["text"]!] }]), encoding: .utf8)!
+        let out = MockLLMFixture.requestItems(body).map { ["id": $0["id"]!, "text": $0["text"]!] }
         // 同时带 reasoning_content,应被忽略
-        return (200, try! JSONSerialization.data(withJSONObject: ["choices": [["message": ["content": content, "reasoning_content": "思考过程"]]]]))
+        return (200, MockLLMFixture.chatResponse(MockLLMFixture.itemsEnvelope(out), reasoningContent: "思考过程"))
     }
     let c = LLMConfig(baseURL: "http://127.0.0.1:3425/v1", model: "m", apiKey: "", reasoningEffort: "high", course: "计算机网络")
     let r = try? await TextCorrector(config: c, session: sess).correct([(time: "00:00:01", text: "你好")])
@@ -872,9 +787,18 @@ if CommandLine.arguments.contains("--real5") {
 await additionalRegressionChecks()
 await finishAndReplayRegressionChecks()
 await saveRootSnapshotChecks()
+await recordingPlacementChecks()
+if !skipCorrection {
+    await continuousCorrectionChecks()
+}
 await inputSwitchRegressionChecks()
 await libraryRegressionChecks()
+await phase1DocumentParsingRegressionChecks()
+await phase2PlaybackAndLocatorRegressionChecks()
+await phase3InSessionSafetyRegressionChecks()
+await phase4LibraryAndNamingRegressionChecks()
+await workspaceStateRegressionChecks()
+await build30RecoveryRegressionChecks()
 await reviewRegressionChecks(includeRecognition: CommandLine.arguments.contains("--real"))
 
-print("\n\(failures == 0 ? "全部通过" : "失败 \(failures) 项")")
-exit(failures == 0 ? 0 : 1)
+finishAndExit(startedAt: runStartedAt)

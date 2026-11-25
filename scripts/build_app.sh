@@ -33,8 +33,8 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
  <key>CFBundleExecutable</key><string>Tingjian</string>
  <key>CFBundleIconFile</key><string>AppIcon</string>
  <key>CFBundlePackageType</key><string>APPL</string>
- <key>CFBundleShortVersionString</key><string>1.0.1</string>
- <key>CFBundleVersion</key><string>23</string>
+ <key>CFBundleShortVersionString</key><string>1.0.2</string>
+ <key>CFBundleVersion</key><string>31</string>
  <key>UTExportedTypeDeclarations</key>
  <array><dict>
   <key>UTTypeIdentifier</key><string>com.local.tingjian.workspace-item</string>

@@ -5,6 +5,58 @@ public enum Timecode {
         let s = max(0, Int(seconds.rounded(.down)))
         return String(format: "%02d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
     }
+
+    /// 解析 "HH:MM:SS" 为秒数；格式非法返回 nil。
+    public static func parse(_ text: String) -> Double? {
+        let parts = text.split(separator: ":")
+        guard parts.count == 3,
+              let h = Int(parts[0]), let m = Int(parts[1]), let s = Int(parts[2]),
+              h >= 0, (0..<60).contains(m), (0..<60).contains(s) else { return nil }
+        return Double(h * 3600 + m * 60 + s)
+    }
+}
+
+/// 文稿时间轴定位与页内查找纯算法（无 UI 依赖，便于回归测试）。
+public enum TranscriptLocator {
+    /// 基于有序起始时间数组二分定位当前播放时间对应的块索引。
+    /// 若存在同秒多个段落，返回最后一个起始时间 <= position + tolerance 的有效索引。
+    public static func activeBlockIndex(at position: Double, timestamps: [Double?], tolerance: Double = 0.05) -> Int? {
+        guard position.isFinite, position >= 0, !timestamps.isEmpty else { return nil }
+        var valid: [(index: Int, time: Double)] = []
+        valid.reserveCapacity(timestamps.count)
+        for (idx, t) in timestamps.enumerated() {
+            if let t, t.isFinite, t >= 0 { valid.append((idx, t)) }
+        }
+        guard !valid.isEmpty else { return nil }
+        let cutoff = position + tolerance
+        if cutoff < valid[0].time { return nil }
+        var low = 0
+        var high = valid.count - 1
+        var answer = 0
+        while low <= high {
+            let mid = low + (high - low) / 2
+            if valid[mid].time <= cutoff {
+                answer = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        return valid[answer].index
+    }
+
+    /// 大小写不敏感的页内关键词匹配，返回命中的块索引列表。
+    public static func matchingBlockIndices(query: String, texts: [String]) -> [Int] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return [] }
+        var hits: [Int] = []
+        for (idx, text) in texts.enumerated() {
+            if text.range(of: needle, options: [.caseInsensitive, .diacriticInsensitive]) != nil {
+                hits.append(idx)
+            }
+        }
+        return hits
+    }
 }
 
 public enum TranscriptStatus: String, Codable, Sendable {
@@ -46,7 +98,7 @@ public struct TranscriptAssembler {
     public private(set) var events: [TranscriptEvent] = []
     public private(set) var segments: [Segment] = []
     public private(set) var volatileText = ""
-    private var volatileStart = 0.0
+    public private(set) var volatileStart = 0.0
 
     public var lastEnd: Double { events.last?.end ?? 0 }
 
@@ -138,10 +190,11 @@ public struct TranscriptAssembler {
     private static func matchToken(in text: String, at index: String.Index) -> String? {
         let character = text[index]
         if isSubstantive(character) { return String(character).lowercased() }
+        let previousIsNumber = index > text.startIndex && text[text.index(before: index)].isNumber
+        if (character == "%" || character == "％") && previousIsNumber { return "%" }
         let next = text.index(after: index)
         guard next < text.endIndex, text[next].isNumber else { return nil }
         if character == "-" || character == "－" { return "-" }
-        let previousIsNumber = index > text.startIndex && text[text.index(before: index)].isNumber
         guard previousIsNumber else { return nil }
         switch character {
         case ".", "．": return "."
@@ -185,8 +238,17 @@ public struct TranscriptAssembler {
                 break
             }
         }
+        var hasSemanticRemainder = false
+        var scanIdx = vIdx
+        while scanIdx < text.endIndex {
+            if matchToken(in: text, at: scanIdx) != nil {
+                hasSemanticRemainder = true
+                break
+            }
+            scanIdx = text.index(after: scanIdx)
+        }
         let remainder = String(text[vIdx...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        return remainder.contains(where: isSubstantive) ? .extended(remainder) : .exactMatch
+        return hasSemanticRemainder && !remainder.isEmpty ? .extended(remainder) : .exactMatch
     }
 
     /// 若 volatile 以已提交文本为前缀(忽略空白、标点与大小写),返回尚未提交的后半句;

@@ -1,6 +1,21 @@
 import Darwin
 import Foundation
 
+/// 资料库目录排序策略。
+public enum LibrarySortOrder: String, CaseIterable, Identifiable, Sendable {
+    case newestFirst
+    case nameAscending
+
+    public var id: Self { self }
+
+    public var title: String {
+        switch self {
+        case .newestFirst: "最新录音优先"
+        case .nameAscending: "按名称升序"
+        }
+    }
+}
+
 /// 资料库中的一项:磁盘上的真实文件或文件夹。
 public struct LibraryEntry: Identifiable, Equatable, Sendable {
     public enum Kind: String, Sendable { case directory, audio, document }
@@ -93,7 +108,8 @@ public actor ProjectLibrary {
         protectedURLs = urls.map { $0.standardizedFileURL }
     }
 
-    public func children(of directory: URL, classifyDirectories: Bool = true) throws -> [LibraryEntry] {
+    public func children(of directory: URL, classifyDirectories: Bool = true,
+                         sortOrder: LibrarySortOrder = .newestFirst) throws -> [LibraryEntry] {
         let dir = directory.standardizedFileURL
         let fm = FileManager.default
         var isDir: ObjCBool = false
@@ -125,11 +141,34 @@ public actor ProjectLibrary {
                 entries.append(LibraryEntry(url: url, name: url.lastPathComponent, kind: .document, isRecordingBundle: false))
             }
         }
-        entries.sort { a, b in
+        return Self.sortEntries(entries, order: sortOrder)
+    }
+
+    /// 统一目录与文件排序规则：目录始终在前；`newestFirst` 下普通项目按名称升序在前、带日期前缀的录音按时间倒序置顶。
+    public nonisolated static func sortEntries(_ entries: [LibraryEntry], order: LibrarySortOrder) -> [LibraryEntry] {
+        entries.sorted { a, b in
             if (a.kind == .directory) != (b.kind == .directory) { return a.kind == .directory }
-            return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            switch order {
+            case .nameAscending:
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            case .newestFirst:
+                let aKey = a.kind == .directory ? a.name : (a.name as NSString).deletingPathExtension
+                let bKey = b.kind == .directory ? b.name : (b.name as NSString).deletingPathExtension
+                let aParts = Paths.parseRecordingName(aKey)
+                let bParts = Paths.parseRecordingName(bKey)
+                switch (aParts, bParts) {
+                case (let ap?, let bp?):
+                    if ap.prefix != bp.prefix { return ap.prefix > bp.prefix }
+                    return a.name.localizedStandardCompare(b.name) == .orderedAscending
+                case (nil, .some):
+                    return true
+                case (.some, nil):
+                    return false
+                case (nil, nil):
+                    return a.name.localizedStandardCompare(b.name) == .orderedAscending
+                }
+            }
         }
-        return entries
     }
 
     public func createRecordingPlacement(named title: String, in parent: URL) throws -> RecordingPlacement {
@@ -207,14 +246,14 @@ public actor ProjectLibrary {
         let newName = try validatedName(name, fileExtension: fileExtension)
         let destination = src.deletingLastPathComponent().appendingPathComponent(newName, isDirectory: kind == .directory)
         guard destination.standardizedFileURL != src else { return src }
-        if FileManager.default.fileExists(atPath: destination.path) {
+        if FileManager.default.fileExists(atPath: destination.path), !isSameFileResource(src, destination) {
             throw LibraryError.nameConflict(newName)
         }
 
         let parent = src.deletingLastPathComponent()
         let scan = kind == .directory ? src : parent
         if kind == .directory && !syncFilePrefixes {
-            try FileManager.default.moveItem(at: src, to: destination)
+            try moveFilePreservingCaseRename(from: src, to: destination)
             return destination
         }
         let fm = FileManager.default
@@ -226,7 +265,8 @@ public actor ProjectLibrary {
                 let old = child.lastPathComponent
                 guard values.isRegularFile == true, values.isSymbolicLink != true, old.hasPrefix(src.lastPathComponent) else { continue }
                 let renamed = newName + old.dropFirst(src.lastPathComponent.count)
-                guard !fm.fileExists(atPath: scan.appendingPathComponent(renamed).path) else {
+                let childDestination = scan.appendingPathComponent(renamed)
+                if fm.fileExists(atPath: childDestination.path), !isSameFileResource(child, childDestination) {
                     throw LibraryError.nameConflict(renamed)
                 }
                 names[old] = renamed
@@ -263,13 +303,13 @@ public actor ProjectLibrary {
         var moved: [(from: URL, to: URL)] = []
         var written = 0
         do {
-            try fm.moveItem(at: src, to: destination)
+            try moveFilePreservingCaseRename(from: src, to: destination)
             moved.append((src, destination))
             if kind == .directory {
                 for (before, after) in names.sorted(by: { $0.key < $1.key }) {
                     let from = destination.appendingPathComponent(before)
                     let to = destination.appendingPathComponent(after)
-                    try fm.moveItem(at: from, to: to)
+                    try moveFilePreservingCaseRename(from: from, to: to)
                     moved.append((from, to))
                 }
             }
@@ -284,7 +324,7 @@ public actor ProjectLibrary {
                 catch { failures.append(edit.target.path + " " + error.localizedDescription) }
             }
             for step in moved.reversed() {
-                do { try fm.moveItem(at: step.to, to: step.from) }
+                do { try moveFilePreservingCaseRename(from: step.to, to: step.from) }
                 catch { failures.append(step.to.path + " " + error.localizedDescription) }
             }
             if !failures.isEmpty { throw LibraryError.rollbackFailed(failures.joined(separator: "\n")) }
@@ -375,6 +415,49 @@ public actor ProjectLibrary {
                values.isRegularFile == true, values.isSymbolicLink != true { return url }
         }
         return nil
+    }
+
+    /// 解析同目录下校正版引用的「原始转写」文稿；拒绝跨目录路径与符号链接。
+    public nonisolated static func linkedOriginalDocument(named name: String, beside document: URL) -> URL? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != ".", trimmed != "..",
+              !trimmed.contains("/"), !trimmed.contains("\\") else { return nil }
+        let parent = document.deletingLastPathComponent()
+        let candidate = parent.appendingPathComponent(trimmed).standardizedFileURL
+        guard candidate != document.standardizedFileURL, isDocument(candidate) else { return nil }
+        guard let values = try? candidate.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true, values.isSymbolicLink != true else { return nil }
+        return candidate
+    }
+
+    /// 查找同目录下针对该原稿生成的最新一份 `_校正版*.md`（不含符号链接）。
+    public nonisolated static func latestCorrectedDocument(for original: URL) -> URL? {
+        guard isDocument(original) else { return nil }
+        let stem = original.deletingPathExtension().lastPathComponent
+        let prefix = stem + "_校正版"
+        let parent = original.deletingLastPathComponent()
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: parent.path) else { return nil }
+        var best: (order: Int, url: URL)?
+        for name in names {
+            let url = parent.appendingPathComponent(name).standardizedFileURL
+            guard url != original.standardizedFileURL, isDocument(url) else { continue }
+            let candidateStem = url.deletingPathExtension().lastPathComponent
+            let order: Int
+            if candidateStem == prefix {
+                order = 1
+            } else if candidateStem.hasPrefix(prefix + "_"),
+                      let n = Int(candidateStem.dropFirst(prefix.count + 1)), n >= 2 {
+                order = n
+            } else {
+                continue
+            }
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            if best == nil || order > best!.order {
+                best = (order, url)
+            }
+        }
+        return best?.url
     }
 
     public func move(_ plan: LibraryMovePlan, into directory: URL) throws -> [URL] {
@@ -491,6 +574,25 @@ public actor ProjectLibrary {
         if values?.isSymbolicLink == true {
             throw LibraryError.operationFailed("符号链接不能改名或移动:\(url.path)")
         }
+    }
+
+    private func isSameFileResource(_ a: URL, _ b: URL) -> Bool {
+        guard let idA = (try? a.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier) as? NSObject,
+              let idB = (try? b.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier) as? NSObject else {
+            return false
+        }
+        return idA.isEqual(idB)
+    }
+
+    /// 兼容大小写不敏感 APFS 上仅改大小写（如 `abc.md -> Abc.md`）的原位重命名。
+    private func moveFilePreservingCaseRename(from source: URL, to destination: URL) throws {
+        if isSameFileResource(source, destination) {
+            guard Darwin.rename(source.path, destination.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            return
+        }
+        try FileManager.default.moveItem(at: source, to: destination)
     }
 
     /// 路径包含判断:按路径分段比较,不把 /a/bc 当成 /a/b 的子项。

@@ -38,6 +38,36 @@ struct TingjianApp: App {
                 Button("关闭当前标签页") { AppModel.shared.closeActiveTab() }
                     .disabled(!AppModel.shared.canCloseActiveTab)
             }
+            CommandMenu("查找") {
+                Button("在文稿中查找…") { AppModel.shared.presentDocumentSearch() }
+                    .keyboardShortcut("f", modifiers: .command)
+                    .disabled(!AppModel.shared.canSearchCurrentDocument)
+                Button("查找下一个") { AppModel.shared.stepDocumentSearch(1) }
+                    .keyboardShortcut("g", modifiers: .command)
+                    .disabled(!AppModel.shared.canStepDocumentSearch)
+                Button("查找上一个") { AppModel.shared.stepDocumentSearch(-1) }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                    .disabled(!AppModel.shared.canStepDocumentSearch)
+            }
+            CommandMenu("播放") {
+                Button(AppModel.shared.playback.isPlaying ? "暂停播放" : "开始播放") {
+                    AppModel.shared.togglePlaybackIfAvailable()
+                }
+                .disabled(!AppModel.shared.canControlPlayback)
+                Button("快退 5 秒") { AppModel.shared.skipPlayback(by: -5) }
+                    .keyboardShortcut("[", modifiers: .command)
+                    .disabled(!AppModel.shared.canControlPlayback)
+                Button("快进 10 秒") { AppModel.shared.skipPlayback(by: 10) }
+                    .keyboardShortcut("]", modifiers: .command)
+                    .disabled(!AppModel.shared.canControlPlayback)
+                Divider()
+                ForEach(PlaybackModel.supportedRates, id: \.self) { rate in
+                    let label = rate == 1.0 ? "1.0x（正常）" : (rate == 1.25 ? "1.25x" : (rate == 1.5 ? "1.5x" : "2.0x"))
+                    Button((abs(AppModel.shared.playback.rate - rate) < 0.01 ? "✓ " : "") + label) {
+                        AppModel.shared.playback.rate = rate
+                    }
+                }
+            }
             CommandMenu("资料库") {
                 Button("回到当前录音") { AppModel.shared.showCurrentRecording() }
                     .disabled(!AppModel.shared.hasCurrentRecording)

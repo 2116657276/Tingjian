@@ -929,17 +929,505 @@ final class QuietEngine: TranscriptionEngine, @unchecked Sendable {
     func cancel() async {}
 }
 
-final class TestCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = 0
-    var count: Int { lock.withLock { value } }
-    func increment() { add(1) }
-    func add(_ amount: Int) { lock.withLock { value += amount } }
+func phase1DocumentParsingRegressionChecks() async {
+    section("Phase 1:文稿结构化解析、关联文稿与重转写状态")
+
+    // 1. 含部分完成状态、说明与缺口的原稿
+    var partialAsm = TranscriptAssembler()
+    partialAsm.commit(start: 1, end: 5, text: "同学们好，今天讲物理层。")
+    partialAsm.markGap(start: 60, end: 135)
+    partialAsm.commit(start: 136, end: 145, text: "接下来看信道容量。")
+    let partialDoc = MarkdownDoc(
+        title: "计算机网络",
+        date: Date(timeIntervalSince1970: 1_732_435_200),
+        duration: 185,
+        audioName: "2026-11-24_14-00-00_计算机网络.m4a",
+        engine: "Apple SpeechAnalyzer / SpeechTranscriber",
+        language: "zh-CN",
+        status: .partial,
+        notes: ["00:01:00 输入设备已切换为 AirPods Pro。", "识别服务中断，部分区间未补全。"],
+        segments: partialAsm.segments
+    ).render()
+
+    let parsedPartial = MarkdownDoc.parseDocument(partialDoc)
+    await check("parseDocument 提取标题、时长、状态与说明",
+                parsedPartial.title == "计算机网络"
+                    && parsedPartial.duration == "00:03:05"
+                    && parsedPartial.status == TranscriptStatus.partial
+                    && parsedPartial.notes.count == 2
+                    && !parsedPartial.isCorrected)
+    await check("parseDocument 保留缺口块并与正文按原顺序排列",
+                parsedPartial.gapCount == 1
+                    && parsedPartial.blocks == [
+                        ParsedDocumentBlock.segment(time: "00:00:01", text: "同学们好，今天讲物理层。"),
+                        ParsedDocumentBlock.gap(start: "00:01:00", end: "00:02:15", note: "此区间转写不完整"),
+                        ParsedDocumentBlock.segment(time: "00:02:16", text: "接下来看信道容量。"),
+                    ],
+                "\(parsedPartial.blocks)")
+    await check("原 parseSegments 兼容只返回非缺口正文段", MarkdownDoc.parseSegments(partialDoc).count == 2)
+
+    // 2. 校正版（含模型名、原稿引用与删空锚点段）
+    let correctedMD = try! TextCorrector.buildCorrectedMarkdown(
+        original: partialDoc,
+        corrected: ["同学们好，今天讲解物理层。", ""],
+        originalName: "2026-11-24_14-00-00_计算机网络.md",
+        model: "deepseek-flash"
+    )
+    let parsedCorrected = MarkdownDoc.parseDocument(correctedMD)
+    await check("parseDocument 识别校正版模型名与原始转写引用",
+                parsedCorrected.isCorrected
+                    && parsedCorrected.correctedModel == "deepseek-flash"
+                    && parsedCorrected.originalDocumentName == "2026-11-24_14-00-00_计算机网络.md")
+    await check("parseDocument 准确统计校正版空时间锚点与保留缺口",
+                parsedCorrected.emptySegmentCount == 1 && parsedCorrected.gapCount == 1)
+
+    let legacyCorrected = "> 本文件为 LLM 文字校正版。原始转写:[[旧原稿.md]]\n\n[00:00:01] 正文。\n"
+    let parsedLegacy = MarkdownDoc.parseDocument(legacyCorrected)
+    await check("兼容无模型名括号的旧校正版引用",
+                parsedLegacy.isCorrected && parsedLegacy.correctedModel == nil && parsedLegacy.originalDocumentName == "旧原稿.md")
+
+    // 3. 普通无时间戳 Markdown 笔记
+    let plainMD = "# 课程大纲\n\n- 第一章 概述\n- 第二章 物理层\n"
+    let parsedPlain = MarkdownDoc.parseDocument(plainMD)
+    await check("普通 Markdown 不误判为转写稿",
+                parsedPlain.title == "课程大纲" && !parsedPlain.hasTranscriptMetadata && parsedPlain.blocks.isEmpty)
+
+    // 4. 同目录原稿/校正版安全解析（拒绝越权路径、自引用与符号链接）
+    let dir = fresh("phase1-links")
+    let orig = dir.appendingPathComponent("课.md")
+    let corr1 = dir.appendingPathComponent("课_校正版.md")
+    let corr2 = dir.appendingPathComponent("课_校正版_2.md")
+    let outside = dir.deletingLastPathComponent().appendingPathComponent("outside.md")
+    let sym = dir.appendingPathComponent("课_校正版_9.md")
+    try! "# 原稿\n".write(to: orig, atomically: true, encoding: .utf8)
+    try! "# 校正1\n".write(to: corr1, atomically: true, encoding: .utf8)
+    try! "# 校正2\n".write(to: corr2, atomically: true, encoding: .utf8)
+    try! "# 外部\n".write(to: outside, atomically: true, encoding: .utf8)
+    try! FileManager.default.createSymbolicLink(at: sym, withDestinationURL: outside)
+
+    await check("同目录解析原始转写成功", ProjectLibrary.linkedOriginalDocument(named: "课.md", beside: corr2) == orig.standardizedFileURL)
+    await check("拒绝跨目录与自引用原始转写",
+                ProjectLibrary.linkedOriginalDocument(named: "../outside.md", beside: corr2) == nil
+                    && ProjectLibrary.linkedOriginalDocument(named: "课_校正版_2.md", beside: corr2) == nil)
+    await check("查找最新校正版选编号最大且跳过符号链接",
+                ProjectLibrary.latestCorrectedDocument(for: orig) == corr2.standardizedFileURL)
+
+    // 5. Retranscriber.writeMarkdown 空段状态修正
+    let rtDir = fresh("phase1-retranscribe")
+    let fakeAudio = rtDir.appendingPathComponent("sample.m4a")
+    try! Data().write(to: fakeAudio)
+    let emptyOut = try! Retranscriber.writeMarkdown(audio: fakeAudio, assembler: TranscriptAssembler(), duration: 12)
+    let emptyParsed = MarkdownDoc.parseDocument((try? String(contentsOf: emptyOut, encoding: .utf8)) ?? "")
+    await check("0 段重转写不误标完成且附未识别说明",
+                emptyParsed.status == TranscriptStatus.partial && emptyParsed.notes.contains { $0.contains("未识别出文字") })
+    var nonEmptyAsm = TranscriptAssembler()
+    nonEmptyAsm.commit(start: 0, end: 2, text: "已有识别文字")
+    let okOut = try! Retranscriber.writeMarkdown(audio: fakeAudio, assembler: nonEmptyAsm, duration: 12)
+    let okParsed = MarkdownDoc.parseDocument((try? String(contentsOf: okOut, encoding: .utf8)) ?? "")
+    await check("有文字重转写标记完成且另存不覆盖", okOut != emptyOut && okParsed.status == TranscriptStatus.completed)
 }
 
-final class IntLog: @unchecked Sendable {
-    private let lock = NSLock()
-    private var items: [Int] = []
-    var values: [Int] { lock.withLock { items } }
-    func append(_ value: Int) { lock.withLock { items.append(value) } }
+func phase2PlaybackAndLocatorRegressionChecks() async {
+    section("Phase 2:时间码解析、播放段落二分定位与页内查找")
+
+    await check("Timecode.parse 解析标准时间码",
+                Timecode.parse("00:00:00") == 0
+                    && Timecode.parse("01:02:03") == 3723
+                    && Timecode.parse("12:59:59") == 46799)
+    await check("Timecode.parse 拒绝非法时间码",
+                Timecode.parse("00:60:00") == nil
+                    && Timecode.parse("00:00:60") == nil
+                    && Timecode.parse("12:34") == nil
+                    && Timecode.parse("invalid") == nil)
+
+    let times: [Double?] = [5.0, 12.0, 12.0, nil, 30.0, 90.0]
+    await check("二分定位：空数组与首段前返回 nil",
+                TranscriptLocator.activeBlockIndex(at: 10, timestamps: []) == nil
+                    && TranscriptLocator.activeBlockIndex(at: 2.0, timestamps: times) == nil)
+    await check("二分定位：段中与同秒多段取最后匹配项",
+                TranscriptLocator.activeBlockIndex(at: 5.0, timestamps: times) == 0
+                    && TranscriptLocator.activeBlockIndex(at: 11.5, timestamps: times) == 0
+                    && TranscriptLocator.activeBlockIndex(at: 12.0, timestamps: times) == 2
+                    && TranscriptLocator.activeBlockIndex(at: 29.0, timestamps: times) == 2)
+    await check("二分定位：跳过 nil 项、尾部与 NaN 安全处理",
+                TranscriptLocator.activeBlockIndex(at: 30.0, timestamps: times) == 4
+                    && TranscriptLocator.activeBlockIndex(at: 500.0, timestamps: times) == 5
+                    && TranscriptLocator.activeBlockIndex(at: .nan, timestamps: times) == nil
+                    && TranscriptLocator.activeBlockIndex(at: -1.0, timestamps: times) == nil)
+
+    let texts = ["同学们好，今天讲 TCP 拥塞控制。", "我们看慢启动和拥塞避免。", "此区间转写不完整", "tcp 快速重传与快速恢复。"]
+    await check("页内查找：大小写不敏感且忽略首尾空白",
+                TranscriptLocator.matchingBlockIndices(query: "  tcp ", texts: texts) == [0, 3])
+    await check("页内查找：中文多命中按序返回且空查询返回空",
+                TranscriptLocator.matchingBlockIndices(query: "拥塞", texts: texts) == [0, 1]
+                    && TranscriptLocator.matchingBlockIndices(query: "   ", texts: texts).isEmpty)
+}
+
+private struct MockHardwareEnv: HardwareInputEnvironment {
+    var closed: Bool?
+    var defaultUID: String?
+    var builtInMap: [String: Bool]
+    func isClamshellClosed() -> Bool? { closed }
+    func defaultInputUID() -> String? { defaultUID }
+    func isBuiltInInput(uid: String) -> Bool? { builtInMap[uid] }
+}
+
+private final class GuardedMockSource: AudioSource, @unchecked Sendable {
+    var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    var onInterruption: (@Sendable (String) -> Void)?
+    var onEnd: (@Sendable () -> Void)?
+    var activeDeviceUID: String?
+    var activeDeviceName: String?
+    var requiresHardwareInputGuard: Bool { true }
+    var starts = 0
+    private let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false)!
+
+    init(uid: String) {
+        self.activeDeviceUID = uid
+        self.activeDeviceName = uid
+    }
+    func requestAccess() async -> Bool { true }
+    func prepare() async throws -> AVAudioFormat { fmt }
+    func start() async throws { starts += 1 }
+    func restart() async throws { starts += 1 }
+    func pause() async {}
+    func stop() async {}
+
+    func push(frames: AVAudioFrameCount, amplitude: Float) {
+        guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames) else { return }
+        buf.frameLength = frames
+        let ch = buf.floatChannelData![0]
+        for i in 0..<Int(frames) {
+            ch[i] = amplitude == 0 ? 0 : amplitude * sin(Float(i) * 0.1)
+        }
+        onBuffer?(buf)
+    }
+}
+
+@MainActor
+func phase3InSessionSafetyRegressionChecks() async {
+    section("Phase 3:合盖内置麦拦截、录中改名与持续静音提醒")
+
+    // 1. HardwareInputGuard 全矩阵
+    let closedBuiltInDefault = MockHardwareEnv(closed: true, defaultUID: "built-in", builtInMap: ["built-in": true, "airpods": false])
+    let closedExtDefault = MockHardwareEnv(closed: true, defaultUID: "airpods", builtInMap: ["built-in": true, "airpods": false])
+    let openEnv = MockHardwareEnv(closed: false, defaultUID: "built-in", builtInMap: ["built-in": true])
+    let unknownClamshell = MockHardwareEnv(closed: nil, defaultUID: "built-in", builtInMap: ["built-in": true])
+    let unknownDevice = MockHardwareEnv(closed: true, defaultUID: "mystery", builtInMap: [:])
+
+    await check("合盖+直选内置麦拦截，合盖+系统默认指向内置麦拦截",
+                HardwareInputGuard.blockReason(for: "built-in", environment: closedBuiltInDefault) != nil
+                    && HardwareInputGuard.blockReason(for: nil, environment: closedBuiltInDefault) != nil)
+    await check("合盖+外接麦（直选与系统默认）均放行",
+                HardwareInputGuard.blockReason(for: "airpods", environment: closedBuiltInDefault) == nil
+                    && HardwareInputGuard.blockReason(for: nil, environment: closedExtDefault) == nil)
+    await check("开盖或合盖/设备状态未知时安全降级放行",
+                HardwareInputGuard.blockReason(for: "built-in", environment: openEnv) == nil
+                    && HardwareInputGuard.blockReason(for: "built-in", environment: unknownClamshell) == nil
+                    && HardwareInputGuard.blockReason(for: nil, environment: unknownDevice) == nil)
+
+    // 2. Recorder 拦截：开录、换麦与恢复
+    let builtInSrc = GuardedMockSource(uid: "built-in")
+    let extSrc = GuardedMockSource(uid: "airpods")
+    let blockedLocal = fresh("p3-blocked-local")
+    let blockedRec = await MainActor.run {
+        let r = Recorder(saveRoot: fresh("p3-blocked-dest"), localRoot: blockedLocal,
+                         makeEngine: { MockEngine(.normal) },
+                         makeSource: { uid in (uid ?? "built-in") == "airpods" ? extSrc : builtInSrc })
+        r.hardwareEnvironment = closedBuiltInDefault
+        r.preferredInputUID = nil
+        return r
+    }
+    let startedBlocked = await blockedRec.start(course: "合盖测试")
+    let blockedDirs = (try? FileManager.default.contentsOfDirectory(at: blockedLocal, includingPropertiesForKeys: nil)) ?? []
+    await check("合盖且系统默认指向内置麦时拒绝开录、不启麦且不留空目录",
+                !startedBlocked && blockedRec.phase == .idle && builtInSrc.starts == 0
+                    && blockedDirs.isEmpty && (blockedRec.message?.contains("合盖") == true))
+
+    // 合盖用外接麦开录成功，切回内置麦被拒且保持外接麦录音
+    await MainActor.run { blockedRec.preferredInputUID = "airpods" }
+    let startedExt = await blockedRec.start(course: "外接麦")
+    var switchBlocked = false
+    do { try await blockedRec.switchInput(to: "built-in") }
+    catch { switchBlocked = error.localizedDescription.contains("合盖") }
+    await check("合盖外接麦正常开录，录音中切回内置麦被拦截且维持原麦",
+                startedExt && switchBlocked && blockedRec.phase == .recording && blockedRec.activeInputUID == "airpods")
+    await blockedRec.stop()
+
+    // 暂停后合盖，原设备为内置麦时 resume 被拦截并保留暂停态
+    let openThenCloseSrc = GuardedMockSource(uid: "built-in")
+    let resumeRec = await MainActor.run {
+        let r = Recorder(saveRoot: fresh("p3-resume-dest"), localRoot: fresh("p3-resume-local"),
+                         makeEngine: { MockEngine(.normal) }, makeSource: { _ in openThenCloseSrc })
+        r.hardwareEnvironment = openEnv
+        r.preferredInputUID = "built-in"
+        return r
+    }
+    _ = await resumeRec.start(course: "开盖开录")
+    await resumeRec.pause()
+    await MainActor.run { resumeRec.hardwareEnvironment = closedBuiltInDefault }
+    await resumeRec.resume()
+    await check("暂停后合盖内置麦继续录音被拦截并保持暂停提示",
+                resumeRec.phase == .paused && (resumeRec.inputIssue?.contains("合盖") == true))
+    await resumeRec.stop()
+
+    // 3. 录中修改/补填课程名（正常交付 + 恢复交付）
+    let renameSrc = GuardedMockSource(uid: "airpods")
+    let renameRec = await MainActor.run {
+        let r = Recorder(saveRoot: fresh("p3-rename-dest"), localRoot: fresh("p3-rename-local"),
+                         makeEngine: { MockEngine(.normal) }, makeSource: { _ in renameSrc })
+        r.hardwareEnvironment = openEnv
+        return r
+    }
+    _ = await renameRec.start(course: "")
+    renameSrc.push(frames: 24000, amplitude: 0.25)
+    try? await Task.sleep(for: .milliseconds(150))
+    await MainActor.run { renameRec.updateCourseName("操作系统导论") }
+    renameSrc.push(frames: 24000, amplitude: 0.25)
+    try? await Task.sleep(for: .milliseconds(150))
+    await renameRec.stop()
+    if let files = renameRec.deliveredFiles {
+        let md = (try? String(contentsOf: files.markdown, encoding: .utf8)) ?? ""
+        await check("录中补填课程名反映到交付目录、文件名与 Markdown 标题",
+                    files.directory.lastPathComponent.contains("操作系统导论")
+                        && files.markdown.lastPathComponent.contains("操作系统导论")
+                        && md.hasPrefix("# 操作系统导论"))
+    } else {
+        await check("录中补填课程名反映到交付目录、文件名与 Markdown 标题", false)
+    }
+
+    // 4. 持续低电平温和静音提醒 + 恢复有效声音自动消除
+    let silentSrc = GuardedMockSource(uid: "airpods")
+    let silentRec = await MainActor.run {
+        let r = Recorder(saveRoot: fresh("p3-silent-dest"), localRoot: fresh("p3-silent-local"),
+                         makeEngine: { QuietEngine() }, makeSource: { _ in silentSrc })
+        r.hardwareEnvironment = openEnv
+        r.silenceWarningThreshold = 0.4
+        return r
+    }
+    _ = await silentRec.start(course: "静音提醒")
+    for _ in 0..<7 {
+        silentSrc.push(frames: 2400, amplitude: 0)
+        try? await Task.sleep(for: .milliseconds(100))
+    }
+    let warned = await MainActor.run { silentRec.silenceWarning != nil && silentRec.phase == .recording }
+    silentSrc.push(frames: 4800, amplitude: 0.2)
+    let cleared = await waitUntil(2) { silentRec.silenceWarning == nil }
+    await check("持续低电平触发温和静音提醒且恢复声音后自动消除", warned && cleared && silentRec.phase == .recording)
+    await silentRec.stop()
+}
+
+func phase4LibraryAndNamingRegressionChecks() async {
+    section("Phase 4:命名解析、新课置顶排序与本地备份容量统计")
+
+    // 1. Paths.parseRecordingName
+    let dated = Paths.parseRecordingName("2026-11-24_14-30-05_高等数学")
+    await check("解析带课程名录音前缀、紧凑日期与重建名称",
+                dated?.prefix == "2026-11-24_14-30-05"
+                    && dated?.course == "高等数学"
+                    && dated?.displayTitle == "高等数学"
+                    && dated?.fullDate == "2026-11-24 14:30"
+                    && dated?.compactDate == "11-24 14:30"
+                    && dated?.rebuiltName(course: "线性代数") == "2026-11-24_14-30-05_线性代数"
+                    && dated?.rebuiltName(course: "  ") == "2026-11-24_14-30-05")
+
+    let undatedCourse = Paths.parseRecordingName("2026-11-24_14-30-05")
+    await check("解析无课程名纯日期录音并拒绝普通项目名",
+                undatedCourse?.course == ""
+                    && undatedCourse?.displayTitle == "课堂录音"
+                    && Paths.parseRecordingName("计算机网络") == nil)
+
+    // 2. ProjectLibrary 排序：newestFirst（普通项目在前 + 日期录音新课置顶）vs nameAscending
+    let root = fresh("p4-sort-root")
+    let lib = ProjectLibrary(root: root)
+    for name in ["操作系统", "计算机网络", "2026-11-20_09-00-00_第一讲", "2026-11-24_14-00-00_第三讲", "2026-11-22_10-00-00_第二讲"] {
+        try! FileManager.default.createDirectory(at: root.appendingPathComponent(name, isDirectory: true), withIntermediateDirectories: true)
+    }
+    try! "# 笔记\n".write(to: root.appendingPathComponent("说明.md"), atomically: true, encoding: .utf8)
+
+    let newest = (try? await lib.children(of: root, classifyDirectories: false, sortOrder: .newestFirst)) ?? []
+    await check("newestFirst：普通项目在前，日期录音按最新倒序置顶，文件在后",
+                newest.map(\.name) == [
+                    "操作系统", "计算机网络",
+                    "2026-11-24_14-00-00_第三讲", "2026-11-22_10-00-00_第二讲", "2026-11-20_09-00-00_第一讲",
+                    "说明.md",
+                ],
+                "\(newest.map(\.name))")
+
+    let asc = (try? await lib.children(of: root, classifyDirectories: false, sortOrder: .nameAscending)) ?? []
+    await check("nameAscending：目录按名称升序，文件在后",
+                asc.first?.name == "2026-11-20_09-00-00_第一讲" && asc.last?.name == "说明.md",
+                "\(asc.map(\.name))")
+
+    // 3. 本地备份容量统计（仅计已交付 .saved，不计未完成）
+    let backupRoot = fresh("p4-backups")
+    let savedA = backupRoot.appendingPathComponent("saved-a", isDirectory: true)
+    let savedB = backupRoot.appendingPathComponent("saved-b", isDirectory: true)
+    let activeC = backupRoot.appendingPathComponent("active-c", isDirectory: true)
+    for (dir, state, bytes) in [(savedA, SessionInfo.State.saved, 4096), (savedB, SessionInfo.State.saved, 8192), (activeC, SessionInfo.State.recording, 16384)] {
+        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let info = SessionInfo(baseName: dir.lastPathComponent, course: "课", startedAt: Date(), state: state)
+        try! SessionStore(dir: dir, info: info).save()
+        try! Data(repeating: 0x5A, count: bytes).write(to: dir.appendingPathComponent("audio.caf"))
+    }
+    let summary = Paths.savedLocalBackupSummary(in: backupRoot)
+    await check("本地备份摘要仅统计已保存目录且包含磁盘占用",
+                summary.count == 2 && summary.totalBytes >= 4096 + 8192,
+                "count=\(summary.count) bytes=\(summary.totalBytes)")
+
+    // 4. APFS 仅改大小写重命名兼容（文件 + 目录同步前缀），真重名仍拒绝
+    let caseRoot = fresh("p4-case-rename")
+    let caseLib = ProjectLibrary(root: caseRoot)
+    let fileLower = caseRoot.appendingPathComponent("note.md")
+    let otherFile = caseRoot.appendingPathComponent("other.md")
+    try! "# hello\n".write(to: fileLower, atomically: true, encoding: .utf8)
+    try! "# other\n".write(to: otherFile, atomically: true, encoding: .utf8)
+    let fileUpper = try? await caseLib.rename(fileLower, to: "Note")
+    await check("APFS 仅改大小写重命名文件成功且内容保留",
+                fileUpper?.lastPathComponent == "Note.md"
+                    && (try? String(contentsOf: fileUpper!, encoding: .utf8)) == "# hello\n")
+    var realConflictRejected = false
+    if let fileUpper {
+        do { _ = try await caseLib.rename(fileUpper, to: "Other") }
+        catch LibraryError.nameConflict { realConflictRejected = true }
+        catch {}
+    }
+    await check("不同文件的大小写冲突重名仍被拒绝", realConflictRejected)
+
+    let dirLower = caseRoot.appendingPathComponent("demo", isDirectory: true)
+    try! FileManager.default.createDirectory(at: dirLower, withIntermediateDirectories: true)
+    try! Data([0x01, 0x02]).write(to: dirLower.appendingPathComponent("demo.m4a"))
+    try! "- 音频:![[demo.m4a]]\n".write(to: dirLower.appendingPathComponent("demo.md"), atomically: true, encoding: .utf8)
+    let dirUpper = try? await caseLib.rename(dirLower, to: "Demo", syncFilePrefixes: true)
+    let updatedDirMD = dirUpper.flatMap { try? String(contentsOf: $0.appendingPathComponent("Demo.md"), encoding: .utf8) } ?? ""
+    await check("APFS 仅改大小写重命名目录并同步直属前缀与链接",
+                dirUpper?.lastPathComponent == "Demo"
+                    && FileManager.default.fileExists(atPath: dirUpper!.appendingPathComponent("Demo.m4a").path)
+                    && updatedDirMD.contains("![[Demo.m4a]]"))
+
+    // 5. 时间轴重叠去重保留百分号 % / ％ 数值语义（通过 TranscriptAssembler 公开 volatile/commit 路径验证）
+    var pctAsm = TranscriptAssembler()
+    pctAsm.setVolatile("命中率大概50%", start: 0)
+    pctAsm.commit(start: 0, end: 2, text: "命中率大概50")
+    // 若 % 被误当无意义标点吞掉，volatileText 会被清空；保留 % 语义后应留下 "%" 后缀
+    await check("重叠去重保留 % 语义，不把 50% 误判为与 50 重复", pctAsm.volatileText == "%", "volatile=\(pctAsm.volatileText)")
+}
+
+private final class VolatileOnlyMockEngine: TranscriptionEngine, @unchecked Sendable {
+    let name = "VolatileOnlyMock"
+    let languageTag = "zh-CN"
+    private var cb: EngineCallbacks?
+    private var sent = false
+    func modelState() async -> ModelState { .ready }
+    func installModel(progress: @escaping @Sendable (Double) -> Void) async throws { progress(1) }
+    func start(callbacks: EngineCallbacks) async throws { cb = callbacks }
+    func feed(_ buffer: AVAudioPCMBuffer, start: Double) {
+        guard !sent, let cb else { return }
+        sent = true
+        Task { @MainActor in cb.volatile("尚未确认的实时课堂草稿", start) }
+    }
+    func finish() async -> Bool { cb = nil; return true }
+    func cancel() async { cb = nil }
+}
+
+private func writeDummyCAF(to url: URL, seconds: Double = 2.0) throws {
+    let fmt = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
+    let file = try AVAudioFile(forWriting: url, settings: fmt.settings)
+    let frames = AVAudioFrameCount(seconds * 16000)
+    let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames)!
+    buf.frameLength = frames
+    try file.write(from: buf)
+}
+
+@MainActor
+func build30RecoveryRegressionChecks() async {
+    section("Build 30 强退实时草稿容灾恢复回归")
+
+    // 1. 仅有 volatile.json（未出首条 final 前强退）：恢复稿应保留实时文字、标部分完成并引导重转
+    do {
+        let local = fresh("b30-vol-only-local"), dest = fresh("b30-vol-only-dest")
+        let sessionDir = local.appendingPathComponent("2026-11-24_23-00-00_强退草稿测试", isDirectory: true)
+        try! FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+        let info = SessionInfo(baseName: sessionDir.lastPathComponent, course: "强退草稿测试", startedAt: Date(), state: .recording)
+        let store = SessionStore(dir: sessionDir, info: info)
+        try! store.prepare()
+        try! writeDummyCAF(to: store.audioURL, seconds: 3.0)
+        try! store.saveVolatile(VolatileSnapshot(start: 0.2, text: "物理层负责透明传送比特流"))
+
+        let rec = Recorder(saveRoot: dest, localRoot: local, makeEngine: { MockEngine(.normal) })
+        await rec.recover(dir: sessionDir)
+        let deliveredMD = rec.deliveredFiles?.markdown
+        let md = deliveredMD.flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
+        let parsed = MarkdownDoc.parseDocument(md)
+        let afterSnap = SessionStore.loadVolatile(dir: sessionDir).snapshot
+        await check("仅 volatile 强退恢复保留文字并标记部分完成",
+                    parsed.status == .partial
+                        && md.contains("物理层负责透明传送比特流")
+                        && md.contains("实时草稿")
+                        && md.contains("重新转写")
+                        && afterSnap == nil,
+                    "status=\(String(describing: parsed.status)) snap=\(String(describing: afterSnap))")
+    }
+
+    // 2. 已有 final + 重叠 volatile.json：恢复时自动剥离重复前缀，仅保留新增后缀
+    do {
+        let local = fresh("b30-vol-overlap-local"), dest = fresh("b30-vol-overlap-dest")
+        let sessionDir = local.appendingPathComponent("2026-11-24_23-01-00_重叠草稿恢复", isDirectory: true)
+        try! FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+        let info = SessionInfo(baseName: sessionDir.lastPathComponent, course: "重叠草稿恢复", startedAt: Date(), state: .recording)
+        let store = SessionStore(dir: sessionDir, info: info)
+        try! store.prepare()
+        try! store.append(TranscriptEvent(kind: .text, start: 0, end: 2.0, text: "计算机网络物理层"))
+        try! store.closeEvents()
+        try! writeDummyCAF(to: store.audioURL, seconds: 5.0)
+        try! store.saveVolatile(VolatileSnapshot(start: 0.0, text: "计算机网络物理层负责透明传送比特流"))
+
+        let rec = Recorder(saveRoot: dest, localRoot: local, makeEngine: { MockEngine(.normal) })
+        await rec.recover(dir: sessionDir)
+        let md = rec.deliveredFiles.flatMap { try? String(contentsOf: $0.markdown, encoding: .utf8) } ?? ""
+        let prefixHits = md.components(separatedBy: "计算机网络物理层").count - 1
+        await check("final + 重叠 volatile 恢复保留新增后缀且不重复前缀",
+                    prefixHits == 1 && md.contains("负责透明传送比特流"),
+                    "prefixHits=\(prefixHits) md=\(md)")
+    }
+
+    // 3. 损坏 volatile.json 容错：不崩溃，记录损坏说明并按缺口兜底
+    do {
+        let local = fresh("b30-vol-corrupt-local"), dest = fresh("b30-vol-corrupt-dest")
+        let sessionDir = local.appendingPathComponent("2026-11-24_23-02-00_损坏快照容错", isDirectory: true)
+        try! FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+        let info = SessionInfo(baseName: sessionDir.lastPathComponent, course: "损坏快照容错", startedAt: Date(), state: .recording)
+        let store = SessionStore(dir: sessionDir, info: info)
+        try! store.prepare()
+        try! writeDummyCAF(to: store.audioURL, seconds: 2.0)
+        try! Data("{broken".utf8).write(to: sessionDir.appendingPathComponent(SessionFiles.volatile))
+
+        let rec = Recorder(saveRoot: dest, localRoot: local, makeEngine: { MockEngine(.normal) })
+        await rec.recover(dir: sessionDir)
+        let md = rec.deliveredFiles.flatMap { try? String(contentsOf: $0.markdown, encoding: .utf8) } ?? ""
+        await check("损坏 volatile.json 容错不崩溃并记录说明与缺口",
+                    rec.deliveredFiles != nil && md.contains("实时草稿快照损坏") && md.contains("此区间转写不完整"),
+                    md)
+    }
+
+    // 4. 录制中首条 volatile 立即落盘，正常 stop() 后自动清空 volatile.json
+    do {
+        let local = fresh("b30-vol-live-local"), dest = fresh("b30-vol-live-dest")
+        let src = GateSource()
+        let rec = Recorder(saveRoot: dest, localRoot: local,
+                           makeEngine: { VolatileOnlyMockEngine() },
+                           makeSource: { _ in src })
+        await rec.start(course: "实时快照验证")
+        _ = await waitUntil(2) { rec.transcribe == .running }
+        let dir = rec.localDir!
+        src.push(frames: 8000)
+        let persisted = await waitUntil(2) {
+            SessionStore.loadVolatile(dir: dir).snapshot?.text == "尚未确认的实时课堂草稿"
+        }
+        await rec.stop()
+        let clearedAfterStop = SessionStore.loadVolatile(dir: dir).snapshot == nil
+        await check("录制中首条 volatile 立即落盘且正常结束后自动清理",
+                    persisted && clearedAfterStop,
+                    "persisted=\(persisted) cleared=\(clearedAfterStop)")
+    }
 }

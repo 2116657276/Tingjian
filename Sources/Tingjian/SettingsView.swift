@@ -13,7 +13,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 24) {
                     header
 
-                    SettingsSection(title: "外观", detail: "浅色、深色或跟随系统;切换立即生效并在重启后保留。") {
+                    SettingsSection(title: "外观", detail: "浅色、深色或跟随系统；切换立即生效并在重启后保留。") {
                         SettingsFieldRow(title: "主题", systemImage: "circle.lefthalf.filled") {
                             Picker("主题", selection: $model.appearance) {
                                 ForEach(AppAppearance.allCases) { option in
@@ -48,7 +48,7 @@ struct SettingsView: View {
 
                         if model.savedInputUnavailable {
                             SettingsDivider()
-                            Text("已保存的输入设备当前不可用。请重新选择设备;也可在底栏为下一次录音临时选择设备。")
+                            Text("已保存的输入设备当前不可用。请重新选择设备；也可在底栏为下一次录音临时选择设备。")
                                 .settingsFootnote()
                                 .foregroundStyle(TingjianTheme.warning)
                                 .padding(.horizontal, 14)
@@ -82,12 +82,12 @@ struct SettingsView: View {
                                     .font(.system(size: 12))
                                     .foregroundStyle(TingjianTheme.secondaryInk)
                                 Spacer(minLength: 8)
-                                Button("移入废纸篓") {
-                                    model.trashed = model.trashSavedBackups()
+                                Button(model.isTrashingBackups ? "正在清理…" : "移入废纸篓") {
+                                    model.trashSavedBackupsAsync()
                                 }
                                 .controlSize(.small)
                                 .foregroundStyle(TingjianTheme.record)
-                                .disabled(model.savedLocalBackups().isEmpty)
+                                .disabled(model.localBackupCount == 0 || model.isTrashingBackups)
                             }
                         }
 
@@ -106,7 +106,7 @@ struct SettingsView: View {
                                 Label(model.isRetranscribing ? "正在转写…" : "选择录音…", systemImage: "waveform")
                             }
                             .controlSize(.small)
-                            .disabled(model.isRetranscribing)
+                            .disabled(model.isRetranscribing || rec.isActive)
                         }
 
                         if let status = model.retranscribe {
@@ -132,105 +132,113 @@ struct SettingsView: View {
                                 .accessibilityLabel("启用文字纠正")
                         }
 
-                        SettingsDivider()
+                        if model.llmEnabled {
+                            SettingsDivider()
 
-                        SettingsFieldRow(title: "纠正方式", systemImage: "text.alignleft") {
-                            VStack(alignment: .trailing, spacing: 4) {
-                                Picker("纠正方式", selection: $model.correctionStyle) {
-                                    ForEach(CorrectionStyle.allCases) { style in
-                                        Text(style.title).tag(style)
+                            SettingsFieldRow(title: "纠正方式", systemImage: "text.alignleft") {
+                                VStack(alignment: .trailing, spacing: 4) {
+                                    Picker("纠正方式", selection: $model.correctionStyle) {
+                                        ForEach(CorrectionStyle.allCases) { style in
+                                            Text(style.title).tag(style)
+                                        }
+                                    }
+                                    .labelsHidden()
+                                    .pickerStyle(.menu)
+                                    .accessibilityLabel("纠正方式")
+                                    Text(model.correctionStyle.detail).settingsFootnote()
+                                }
+                            }
+
+                            SettingsDivider()
+
+                            SettingsFieldRow(title: "网关", systemImage: "network") {
+                                Picker("网关", selection: $model.gatewayChoice) {
+                                    ForEach(GatewayChoice.allCases) { choice in
+                                        Text(choice.title).tag(choice)
                                     }
                                 }
                                 .labelsHidden()
                                 .pickerStyle(.menu)
-                                .accessibilityLabel("纠正方式")
-                                Text(model.correctionStyle.detail).settingsFootnote()
+                                .accessibilityLabel("网关")
                             }
-                        }
 
-                        SettingsDivider()
+                            SettingsDivider()
 
-                        SettingsFieldRow(title: "网关", systemImage: "network") {
-                            Picker("网关", selection: $model.gatewayChoice) {
-                                ForEach(GatewayChoice.allCases) { choice in
-                                    Text(choice.title).tag(choice)
-                                }
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.menu)
-                            .accessibilityLabel("网关")
-                        }
-
-                        SettingsDivider()
-
-                        SettingsFieldRow(title: "网关地址", systemImage: "link") {
-                            if model.gatewayChoice == .custom {
-                                TextField("https://example.com/v1", text: $model.customGatewayAddress)
-                                    .textFieldStyle(.roundedBorder)
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .accessibilityLabel("网关地址")
-                            } else {
-                                Text(model.llmURL)
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .textSelection(.enabled)
-                            }
-                        }
-
-                        SettingsDivider()
-
-                        SettingsFieldRow(title: "模型", systemImage: "cpu") {
-                            modelControl
-                        }
-
-                        SettingsDivider()
-
-                        SettingsFieldRow(title: "推理强度", systemImage: "speedometer") {
-                            effortControl
-                        }
-
-                        SettingsDivider()
-
-                        HStack(alignment: .top, spacing: 10) {
-                            gatewayStatus
-                            Spacer(minLength: 8)
-                            Button {
-                                Task { await model.refreshModels() }
-                            } label: {
-                                if isRefreshingModels {
-                                    ProgressView().controlSize(.small)
-                                } else {
-                                    Label("刷新模型", systemImage: "arrow.clockwise")
-                                }
-                            }
-                            .controlSize(.small)
-                            .disabled(isRefreshingModels || model.gatewayEndpoint == nil)
-                            .accessibilityLabel("刷新模型清单")
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-
-                        SettingsDivider()
-
-                        SettingsFieldRow(title: "API Key", systemImage: "key") {
-                            VStack(alignment: .trailing, spacing: 4) {
-                                HStack {
-                                    SecureField(apiKeyPlaceholder, text: $model.apiKey)
+                            SettingsFieldRow(title: "网关地址", systemImage: "link") {
+                                if model.gatewayChoice == .custom {
+                                    TextField("https://example.com/v1", text: $model.customGatewayAddress)
                                         .textFieldStyle(.roundedBorder)
-                                        .onSubmit { model.saveAPIKey() }
-                                        .accessibilityLabel("API Key")
-                                    Button("保存密钥") { model.saveAPIKey() }
-                                }
-                                if let status = model.apiKeyStatus {
-                                    Text(status).settingsFootnote()
+                                        .font(.system(size: 12, design: .monospaced))
+                                        .accessibilityLabel("网关地址")
+                                } else {
+                                    Text(model.llmURL)
+                                        .font(.system(size: 12, design: .monospaced))
+                                        .textSelection(.enabled)
                                 }
                             }
-                            .disabled(model.gatewayEndpoint == nil)
-                        }
 
-                        Text("每个网关地址单独保存密钥。要移除密钥，请清空后点「保存密钥」。点击「纠正文本」后，转写文字、项目和录音目录名、文稿名及部分文稿开头信息会发给当前网关。校正结果与上下文摘要会缓存在本机。")
-                            .settingsFootnote()
+                            SettingsDivider()
+
+                            SettingsFieldRow(title: "模型", systemImage: "cpu") {
+                                modelControl
+                            }
+
+                            SettingsDivider()
+
+                            SettingsFieldRow(title: "推理强度", systemImage: "speedometer") {
+                                effortControl
+                            }
+
+                            SettingsDivider()
+
+                            HStack(alignment: .top, spacing: 10) {
+                                gatewayStatus
+                                Spacer(minLength: 8)
+                                Button {
+                                    Task { await model.refreshModels() }
+                                } label: {
+                                    if isRefreshingModels {
+                                        ProgressView().controlSize(.small)
+                                    } else {
+                                        Label("刷新模型", systemImage: "arrow.clockwise")
+                                    }
+                                }
+                                .controlSize(.small)
+                                .disabled(isRefreshingModels || model.gatewayEndpoint == nil)
+                                .accessibilityLabel("刷新模型清单")
+                            }
                             .padding(.horizontal, 14)
-                            .padding(.bottom, 12)
+                            .padding(.vertical, 10)
+
+                            SettingsDivider()
+
+                            SettingsFieldRow(title: "API Key", systemImage: "key") {
+                                VStack(alignment: .trailing, spacing: 4) {
+                                    HStack {
+                                        SecureField(apiKeyPlaceholder, text: $model.apiKey)
+                                            .textFieldStyle(.roundedBorder)
+                                            .onSubmit { model.saveAPIKey() }
+                                            .accessibilityLabel("API Key")
+                                        Button("保存密钥") { model.saveAPIKey() }
+                                    }
+                                    if let status = model.apiKeyStatus {
+                                        Text(status).settingsFootnote()
+                                    }
+                                }
+                                .disabled(model.gatewayEndpoint == nil)
+                            }
+
+                            Text("每个网关地址单独保存密钥。要移除密钥，请清空后点「保存密钥」。点击「纠正文本」后，转写文字、项目和录音目录名、文稿名及部分文稿开头信息会发给当前网关。校正结果与上下文摘要会缓存在本机。")
+                                .settingsFootnote()
+                                .padding(.horizontal, 14)
+                                .padding(.bottom, 12)
+                        } else {
+                            SettingsDivider()
+                            Text("开启后可配置 DeepSeek 官方、Magpie 或自定义兼容网关，在课后对转写文稿进行连续段落校对。")
+                                .settingsFootnote()
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                        }
                     }
                 }
                 .frame(maxWidth: 620, alignment: .leading)
@@ -244,6 +252,7 @@ struct SettingsView: View {
         .frame(minHeight: 660)
         .task {
             model.refreshInputDevices()
+            model.refreshLocalBackupsSummary()
         }
     }
 
@@ -276,7 +285,7 @@ struct SettingsView: View {
                 Text(device.name + (device.isDefault ? "(系统默认)" : "")).tag(Optional(device.id))
             }
             if model.savedInputUnavailable, let uid = model.audioInputUID {
-                Text("设备不可用:\(uid)").tag(Optional(uid))
+                Text("\(model.savedInputDisplayName)（当前未连接）").tag(Optional(uid))
             }
         }
         .labelsHidden()
@@ -358,9 +367,11 @@ struct SettingsView: View {
     }
 
     private var localBackupText: String {
-        if let count = model.trashed { return "已移入废纸篓 \(count) 份" }
-        let count = model.savedLocalBackups().count
-        return count == 0 ? "没有可清理的已保存备份" : "\(count) 份已成功交付的本地备份"
+        if let count = model.trashed, model.localBackupCount == 0 { return "已移入废纸篓 \(count) 份" }
+        let count = model.localBackupCount
+        guard count > 0 else { return "没有可清理的已保存备份" }
+        let size = ByteCountFormatter.string(fromByteCount: model.localBackupBytes, countStyle: .file)
+        return "\(count) 份已成功交付的本地备份（共 \(size)）"
     }
 }
 

@@ -50,9 +50,17 @@ public enum Retranscriber {
     /// 写出 `<原名>_重转写.md` 到音频所在目录。
     public static func writeMarkdown(audio: URL, assembler: TranscriptAssembler, duration: Double) throws -> URL {
         let base = audio.deletingPathExtension().lastPathComponent
-        let doc = MarkdownDoc(title: "重新转写:\(base)", date: Date(), duration: duration,
+        let hasText = assembler.segments.contains {
+            !$0.incomplete && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let status: TranscriptStatus = hasText ? .completed : .partial
+        var notes = ["本文件由已保存录音重新转写生成，不覆盖原始转写。"]
+        if !hasText {
+            notes.append("本次重新转写未识别出文字（可能为静音、设备无有效输入或音频过弱）。")
+        }
+        let doc = MarkdownDoc(title: "重新转写：\(base)", date: Date(), duration: duration,
                               audioName: audio.lastPathComponent, engine: SpeechEngine().name, language: "zh-CN",
-                              status: .completed, notes: ["本文件由已保存录音重新转写生成,不覆盖原始转写。"],
+                              status: status, notes: notes,
                               segments: assembler.segments)
         return try Paths.writeUniqueMarkdown(doc.render(), base: base + "_重转写", in: audio.deletingLastPathComponent())
     }
