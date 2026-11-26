@@ -19,9 +19,21 @@ extension AppModel {
         drafts[index].name = name
     }
 
-    /// 录音或暂停期间修改当前会话的课程名，同步反映到暂存区标题与最终交付文件名。
-    func updateActiveRecordingCourseName(_ name: String) {
+    /// 录音或暂停期间修改当前会话的课程名，防抖后同步到暂存区标题与最终交付文件名，不反向覆盖输入框。
+    func scheduleActiveCourseNameSync() {
+        courseNameSyncTask?.cancel()
+        courseNameSyncTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            self?.flushActiveCourseName()
+        }
+    }
+
+    func flushActiveCourseName() {
+        courseNameSyncTask?.cancel()
+        courseNameSyncTask = nil
         guard recorder.phase == .recording || recorder.phase == .paused else { return }
+        let name = activeCourseNameDraft
         recorder.updateCourseName(name)
         if let activeID = activeDraftID, let index = drafts.firstIndex(where: { $0.id == activeID }) {
             drafts[index].name = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -174,6 +186,7 @@ extension AppModel {
             return
         }
         let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        activeCourseNameDraft = name
         recorder.preferredInputUID = nextInputUID
         inputSwitchError = nil
         libraryNotice = nil
@@ -190,7 +203,7 @@ extension AppModel {
 
     var canStartRecording: Bool {
         guard let id = selection.draftID else { return false }
-        return !recordingBusy && !isDraftLocked(id) && !nextInputUnavailable
+        return !recordingBusy && !isDraftLocked(id) && !nextInputUnavailable && !isRetranscribing && !isCorrecting
     }
 
     func requestStopRecording() {
@@ -199,6 +212,7 @@ extension AppModel {
             return
         }
         guard recorder.phase == .recording || recorder.phase == .paused else { return }
+        flushActiveCourseName()
         if recorder.duration < 30 {
             Task { await recorder.stop() }
         } else {
@@ -208,10 +222,15 @@ extension AppModel {
 
     func confirmStopRecording() {
         stopConfirmationRequested = false
+        flushActiveCourseName()
         Task { await recorder.stop() }
     }
 
     func recordingDelivered(_ files: DeliveryResult, draftID: UUID?) {
+        courseNameSyncTask?.cancel()
+        courseNameSyncTask = nil
+        activeCourseNameDraft = ""
+        inputSwitchError = nil
         let showDocument = draftID.map { selection.draftID == $0 } ?? (selection == .currentRecording)
         if let draftID {
             drafts.removeAll { $0.id == draftID }

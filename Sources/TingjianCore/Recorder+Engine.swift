@@ -158,6 +158,7 @@ extension Recorder {
         let old = engine
         Task { await old?.cancel() }
         assembler.clearVolatile()
+        clearVolatileSnapshot()
         publishAssembler()
         attempts += 1
         guard attempts <= 3, phase == .recording || phase == .paused else {
@@ -267,6 +268,16 @@ extension Recorder {
     /// 运行时错误只尝试同 UID 重建一次,失败即暂停,不无限重试、不自动换设备。
     private func recoverInput(reason: String, generation: Int) async {
         guard phase == .recording, sourceGeneration == generation, !stopping else { return }
+        if let current = source, current.requiresHardwareInputGuard,
+           let blocked = HardwareInputGuard.blockReason(for: activeInputUID ?? preferredInputUID, environment: hardwareEnvironment) {
+            await pause()
+            guard sourceGeneration == generation, phase == .paused, !stopping else { return }
+            needsInputRebuild = true
+            inputIssue = blocked
+            addNote("\(reason)，\(blocked)录音已暂停。")
+            persistMetadata()
+            return
+        }
         guard !interruptionRetried else {
             await pause()
             needsInputRebuild = true
@@ -315,6 +326,7 @@ extension Recorder {
                 Task { @MainActor in
                     guard let self, self.phase == .recording else { return }
                     self.addNote("系统进入睡眠,睡眠期间没有录音。")
+                    self.persistMetadata()
                 }
             },
             c.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in

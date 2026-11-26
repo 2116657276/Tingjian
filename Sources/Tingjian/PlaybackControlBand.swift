@@ -219,7 +219,7 @@ struct ControlBand: View {
 
     private var closePlayerButton: some View {
         Button {
-            playback.stop()
+            model.closePlayback()
         } label: {
             Label("关闭音频", systemImage: "xmark.circle")
                 .labelStyle(.iconOnly)
@@ -233,7 +233,7 @@ struct ControlBand: View {
     private var idleControls: some View {
         HStack(spacing: 12) {
             if case .pending = rec.save {
-                Label("音频与文字在本地,尚未写入目标目录", systemImage: "tray.and.arrow.down")
+                Label("音频与文字在本地，尚未写入目标目录", systemImage: "tray.and.arrow.down")
                     .font(.system(size: 12))
                     .foregroundStyle(TingjianTheme.warning)
                 Spacer()
@@ -287,6 +287,7 @@ struct IssueItem: Identifiable {
         case none, retrySave, installModel
         case recover(URL)
         case retryCorrection(URL)
+        case dismiss(String)
     }
     let id: String
     let title: String
@@ -370,9 +371,15 @@ struct StatusBar: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(TingjianTheme.secondaryInk)
             } else if !issues.isEmpty {
-                Label("\(issues.count) 个问题", systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(TingjianTheme.warning)
+                Button {
+                    showIssues.toggle()
+                } label: {
+                    Label("\(issues.count) 个问题", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(TingjianTheme.warning)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("查看 \(issues.count) 个问题")
             } else {
                 Label("就绪", systemImage: "checkmark.circle")
                     .font(.system(size: 11))
@@ -412,7 +419,7 @@ struct StatusBar: View {
         case .idle: "待命"
         case .preparing: "准备中"
         case .running: "转写中"
-        case .recovering(let attempt): "恢复中(第 \(attempt) 次)"
+        case .recovering(let attempt): "恢复中（第 \(attempt) 次）"
         case .needsModel: "缺少中文模型"
         case .unsupported: "不可用"
         case .failed: "异常"
@@ -427,7 +434,7 @@ struct StatusBar: View {
         case .idle: rec.isActive ? "本地持续保存中" : "—"
         case .saving: "写入目标目录中"
         case .saved: "已写入目录"
-        case .pending: "待保存,本地已保留"
+        case .pending: "待保存，本地已保留"
         case .failed: "保存失败"
         }
     }
@@ -493,8 +500,8 @@ struct IssuesPopover: View {
 
     private var saveDetail: String? {
         switch rec.save {
-        case .saved(let path): return "已写入目录:\(path)。这是本地文件写入结果,不代表云同步已完成。"
-        case .pending(let path, _): return "本地恢复文件:\(path)"
+        case .saved(let path): return "已写入目录：\(path)。这是本地文件写入结果，不代表云同步已完成。"
+        case .pending(let path, _): return "本地恢复文件：\(path)"
         default: return nil
         }
     }
@@ -526,6 +533,9 @@ struct IssuesPopover: View {
             Button("重试纠正") { model.startCorrection(document: url) }
                 .buttonStyle(.bordered).controlSize(.small)
                 .disabled(!model.llmConfigured || model.isCorrecting)
+        case .dismiss(let id):
+            Button("知道了") { model.dismissIssue(id: id) }
+                .buttonStyle(.bordered).controlSize(.small)
         }
     }
 }

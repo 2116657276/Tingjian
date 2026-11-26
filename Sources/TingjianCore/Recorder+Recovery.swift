@@ -77,9 +77,10 @@ extension Recorder {
                 }
                 if let effectiveText, !effectiveText.isEmpty {
                     let start = max(max(0, snap.start), assembler.lastEnd)
-                    let end = max(start, dur)
-                    record(assembler.commit(start: start, end: end, text: effectiveText))
-                    recoveredVolatileDraft = true
+                    if let committed = assembler.commit(start: start, end: start, text: effectiveText) {
+                        record(committed)
+                        recoveredVolatileDraft = true
+                    }
                 }
             }
         }
@@ -88,7 +89,8 @@ extension Recorder {
             if recoveredVolatileDraft {
                 notes.append("末段文字来自意外中断前的实时草稿（未经最终确认），原始音频已完整保留，可使用上方「重新转写」获取完整文稿。")
             }
-            if dur > assembler.lastEnd { record(assembler.markGap(start: assembler.lastEnd, end: dur)) }
+            let needsGap = recoveredVolatileDraft ? (dur - assembler.lastEnd > 1.0) : (dur > assembler.lastEnd)
+            if needsGap { record(assembler.markGap(start: assembler.lastEnd, end: dur)) }
         }
         store.clearVolatile()
         publishAssembler()

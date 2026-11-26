@@ -202,12 +202,31 @@ func additionalRegressionChecks() async {
     await quiet.start(course: "静音")
     _ = await waitUntil(2) { quiet.transcribe == .running }
     await quiet.stop()
-    await check("正常完成无文字会话不会误报失败", quiet.finalStatus == .completed && quiet.segments.isEmpty)
+    let quietMD = quiet.deliveredFiles.flatMap { try? String(contentsOf: $0.markdown, encoding: .utf8) } ?? ""
+    await check("正常结束但 0 字会话标部分完成并附未识别说明",
+                quiet.finalStatus == .partial && quiet.segments.isEmpty && quietMD.contains("未识别出文字"),
+                "status=\(String(describing: quiet.finalStatus))")
     let quietDir = quiet.localDir!
     var quietInfo = SessionStore.readInfo(dir: quietDir)!; quietInfo.state = .pendingSave
     try! SessionStore(dir: quietDir, info: quietInfo).save()
     await restore.recover(dir: quietDir)
-    await check("正常无文字待保存会话恢复仍为完成", restore.finalStatus == .completed)
+    await check("正常无文字待保存会话恢复保持部分完成", restore.finalStatus == .partial)
+
+    // Build 32 P2-5: ExportError 非有限时长格式化防 trap + 损坏/0 字节 CAF 导出抛错
+    let nanDesc = ExportError.durationMismatch(.nan, 10.0).localizedDescription
+    let infDesc = ExportError.durationMismatch(.infinity, .nan).localizedDescription
+    await check("ExportError.durationMismatch 对 NaN/Inf 安全格式化不崩溃",
+                nanDesc.contains("无效") && nanDesc.contains("10s") && infDesc.contains("无效"),
+                "nan=\(nanDesc) inf=\(infDesc)")
+    let corruptCAF = fresh("reg-corrupt-export").appendingPathComponent("empty.caf")
+    try! Data().write(to: corruptCAF)
+    var corruptExportFailed = false
+    do {
+        _ = try await AudioExporter.exportM4A(from: corruptCAF, to: corruptCAF.deletingPathExtension().appendingPathExtension("m4a"))
+    } catch {
+        corruptExportFailed = true
+    }
+    await check("损坏或 0 字节 CAF 导出 M4A 时明确抛错", corruptExportFailed)
 
     if !skipCorrection {
         section("修复回归:纠正结构与交付路径")
@@ -632,11 +651,34 @@ func libraryRegressionChecks() async {
         try! FileManager.default.createDirectory(at: guarded, withIntermediateDirectories: true)
         let guardedDoc = guarded.appendingPathComponent("活动文稿.md")
         try! "活动".write(to: guardedDoc, atomically: true, encoding: .utf8)
+        let guardedAudio = guarded.appendingPathComponent("重转写音频.m4a")
+        try! Data(count: 16).write(to: guardedAudio)
+        let placementDir = root.appendingPathComponent("未完成占位目录", isDirectory: true)
+        try! FileManager.default.createDirectory(at: placementDir, withIntermediateDirectories: true)
+        let unrelatedDir = root.appendingPathComponent("普通同级目录", isDirectory: true)
+        try! FileManager.default.createDirectory(at: unrelatedDir, withIntermediateDirectories: true)
         await library.setProtected([guardedDoc])
         do {
             _ = try await library.trash(guarded)
             await check("正在使用的文稿会保护所属录音文件夹", false)
         } catch { await check("正在使用的文稿会保护所属录音文件夹", true) }
+        await library.setProtected([guardedAudio, placementDir])
+        do {
+            _ = try await library.rename(guardedAudio, to: "改名音频.m4a")
+            await check("正在重转写的音频禁止改名", false)
+        } catch { await check("正在重转写的音频禁止改名", true) }
+        do {
+            _ = try await library.trash(guarded)
+            await check("正在重转写的音频会保护所属文件夹", false)
+        } catch { await check("正在重转写的音频会保护所属文件夹", true) }
+        do {
+            _ = try await library.rename(placementDir, to: "改名占位")
+            await check("未完成会话占位目录禁止改名", false)
+        } catch { await check("未完成会话占位目录禁止改名", true) }
+        do {
+            let renamedUnrelated = try await library.rename(unrelatedDir, to: "普通同级目录已改名")
+            await check("仅保护占位目录不误锁同级普通目录", renamedUnrelated.lastPathComponent == "普通同级目录已改名")
+        } catch { await check("仅保护占位目录不误锁同级普通目录", false, "\(error)") }
         await library.setProtected([])
     }
 
@@ -837,6 +879,39 @@ func inputSwitchRegressionChecks() async {
     _ = await starting.value
     try? await Task.sleep(for: .milliseconds(400))
     await check("取消启动后迟到返回不进入录音", cancelRec.phase == .idle && cancelRec.deliveredFiles == nil)
+
+    // Build 32 P2-6: 换麦 prepare 期间并发 pause() 保持暂停且新麦不启动
+    let pOld = GateSource(); pOld.uid = "p-old"
+    let pNew = GateSource(); pNew.uid = "p-new"; pNew.prepareDelay = 0.2
+    let pRec = Recorder(saveRoot: fresh("reg-switch-pause-dest"), localRoot: fresh("reg-switch-pause-local"),
+                        makeEngine: { MockEngine(.normal) }, makeSource: { uid in uid == "p-new" ? pNew : pOld })
+    pRec.preferredInputUID = "p-old"
+    await pRec.start(course: "换麦并发暂停")
+    let switchPauseTask = Task { try? await pRec.switchInput(to: "p-new") }
+    _ = await waitUntil(2) { pNew.prepares == 1 }
+    let pauseTask = Task { await pRec.pause() }
+    await switchPauseTask.value
+    await pauseTask.value
+    await check("换麦 prepare 期间并发 pause() 保持暂停且新麦未启动",
+                pRec.phase == .paused && pNew.starts == 0 && pRec.activeInputUID == "p-new",
+                "phase=\(pRec.phase) starts=\(pNew.starts) uid=\(String(describing: pRec.activeInputUID))")
+    await pRec.stop()
+
+    // Build 32 P2-6: 换麦 prepare 期间旧麦断开不被误暂停，顺利切到新麦录写
+    let dOld = GateSource(); dOld.uid = "d-old"
+    let dNew = GateSource(); dNew.uid = "d-new"; dNew.prepareDelay = 0.2
+    let dRec = Recorder(saveRoot: fresh("reg-switch-disc-dest"), localRoot: fresh("reg-switch-disc-local"),
+                        makeEngine: { MockEngine(.normal) }, makeSource: { uid in uid == "d-new" ? dNew : dOld })
+    dRec.preferredInputUID = "d-old"
+    await dRec.start(course: "换麦期间旧麦断开")
+    let switchDiscTask = Task { try? await dRec.switchInput(to: "d-new") }
+    _ = await waitUntil(2) { dNew.prepares == 1 }
+    await dRec.inputDeviceDisconnected("d-old")
+    await switchDiscTask.value
+    await check("换麦 prepare 期间旧麦断开顺利切至新麦继续录音",
+                dRec.phase == .recording && dRec.activeInputUID == "d-new" && dNew.starts == 1 && dRec.inputIssue == nil,
+                "phase=\(dRec.phase) uid=\(String(describing: dRec.activeInputUID)) starts=\(dNew.starts) issue=\(String(describing: dRec.inputIssue))")
+    await dRec.stop()
 }
 
 final class HangingCleanupEngine: TranscriptionEngine, @unchecked Sendable {
@@ -1171,6 +1246,30 @@ func phase3InSessionSafetyRegressionChecks() async {
                 resumeRec.phase == .paused && (resumeRec.inputIssue?.contains("合盖") == true))
     await resumeRec.stop()
 
+    // Build 32 P2-7: 睡眠唤醒恢复遇合盖内置麦被拦截（不调用 restart）且说明持久化到 session.json
+    let wakeSrc = GuardedMockSource(uid: "built-in")
+    wakeSrc.activeDeviceUID = nil
+    let wakeRec = await MainActor.run {
+        let r = Recorder(saveRoot: fresh("p3-wake-dest"), localRoot: fresh("p3-wake-local"),
+                         makeEngine: { MockEngine(.normal) }, makeSource: { _ in wakeSrc })
+        r.hardwareEnvironment = openEnv
+        r.preferredInputUID = "built-in"
+        return r
+    }
+    _ = await wakeRec.start(course: "唤醒合盖拦截")
+    await MainActor.run {
+        wakeRec.hardwareEnvironment = closedBuiltInDefault
+        wakeSrc.onInterruption?("系统从睡眠中唤醒")
+    }
+    let wakePaused = await waitUntil(2) { wakeRec.phase == .paused && wakeRec.inputIssue != nil }
+    let wakeInfo = wakeRec.localDir.flatMap { SessionStore.readInfo(dir: $0) }
+    await check("睡眠唤醒恢复遇合盖内置麦暂停、不重启麦且持久化说明",
+                wakePaused && wakeSrc.starts == 1
+                    && (wakeRec.inputIssue?.contains("合盖") == true)
+                    && (wakeInfo?.notes.contains { $0.contains("合盖") } == true),
+                "paused=\(wakePaused) starts=\(wakeSrc.starts) issue=\(String(describing: wakeRec.inputIssue)) notes=\(String(describing: wakeInfo?.notes))")
+    await wakeRec.stop()
+
     // 3. 录中修改/补填课程名（正常交付 + 恢复交付）
     let renameSrc = GuardedMockSource(uid: "airpods")
     let renameRec = await MainActor.run {
@@ -1316,18 +1415,30 @@ func phase4LibraryAndNamingRegressionChecks() async {
 private final class VolatileOnlyMockEngine: TranscriptionEngine, @unchecked Sendable {
     let name = "VolatileOnlyMock"
     let languageTag = "zh-CN"
+    private let lock = NSLock()
     private var cb: EngineCallbacks?
     private var sent = false
     func modelState() async -> ModelState { .ready }
     func installModel(progress: @escaping @Sendable (Double) -> Void) async throws { progress(1) }
-    func start(callbacks: EngineCallbacks) async throws { cb = callbacks }
+    func start(callbacks: EngineCallbacks) async throws { lock.withLock { cb = callbacks } }
     func feed(_ buffer: AVAudioPCMBuffer, start: Double) {
-        guard !sent, let cb else { return }
-        sent = true
-        Task { @MainActor in cb.volatile("尚未确认的实时课堂草稿", start) }
+        let callbacks = lock.withLock { () -> EngineCallbacks? in
+            guard !sent else { return nil }
+            sent = true
+            return cb
+        }
+        if let callbacks {
+            Task { @MainActor in callbacks.volatile("尚未确认的实时课堂草稿", start) }
+        }
     }
-    func finish() async -> Bool { cb = nil; return true }
-    func cancel() async { cb = nil }
+    func fail(_ error: Error) {
+        let callbacks = lock.withLock { cb }
+        if let callbacks {
+            Task { @MainActor in callbacks.failure(error) }
+        }
+    }
+    func finish() async -> Bool { lock.withLock { cb = nil }; return true }
+    func cancel() async { lock.withLock { cb = nil } }
 }
 
 private func writeDummyCAF(to url: URL, seconds: Double = 2.0) throws {
@@ -1429,5 +1540,55 @@ func build30RecoveryRegressionChecks() async {
         await check("录制中首条 volatile 立即落盘且正常结束后自动清理",
                     persisted && clearedAfterStop,
                     "persisted=\(persisted) cleared=\(clearedAfterStop)")
+    }
+
+    // 5. Build 32 P1-2: 引擎故障立即清理磁盘 volatile.json，不再在后续强退时复活作废旧草稿
+    do {
+        let local = fresh("b32-vol-fail-local"), dest = fresh("b32-vol-fail-dest")
+        let src = GateSource()
+        let engine = VolatileOnlyMockEngine()
+        var created = 0
+        let rec = Recorder(saveRoot: dest, localRoot: local,
+                           makeEngine: { created += 1; return created == 1 ? engine : QuietEngine() },
+                           makeSource: { _ in src })
+        rec.retryDelay = 5.0
+        await rec.start(course: "故障清草稿")
+        _ = await waitUntil(2) { rec.transcribe == .running }
+        let dir = rec.localDir!
+        src.push(frames: 8000)
+        let persisted = await waitUntil(2) {
+            SessionStore.loadVolatile(dir: dir).snapshot?.text == "尚未确认的实时课堂草稿"
+        }
+        engine.fail(NSError(domain: "b32", code: 1, userInfo: [NSLocalizedDescriptionKey: "注入识别崩溃"]))
+        let clearedOnFailure = await waitUntil(2) {
+            SessionStore.loadVolatile(dir: dir).snapshot == nil && rec.volatileText.isEmpty
+        }
+        await check("引擎故障时立即清理内存与磁盘 volatile.json",
+                    persisted && clearedOnFailure,
+                    "persisted=\(persisted) clearedOnFailure=\(clearedOnFailure)")
+        await rec.stop()
+    }
+
+    // 6. Build 32 P1-2: 有草稿长音频强退恢复同时保留草稿与 > ⚠ 未覆盖缺口卡片
+    do {
+        let local = fresh("b32-vol-gap-local"), dest = fresh("b32-vol-gap-dest")
+        let sessionDir = local.appendingPathComponent("2026-11-25_22-00-00_草稿与缺口共存", isDirectory: true)
+        try! FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+        let info = SessionInfo(baseName: sessionDir.lastPathComponent, course: "草稿与缺口共存", startedAt: Date(), state: .recording)
+        let store = SessionStore(dir: sessionDir, info: info)
+        try! store.prepare()
+        try! writeDummyCAF(to: store.audioURL, seconds: 12.0)
+        try! store.saveVolatile(VolatileSnapshot(start: 2.0, text: "接下来我们看传输层协议"))
+
+        let rec = Recorder(saveRoot: dest, localRoot: local, makeEngine: { MockEngine(.normal) })
+        await rec.recover(dir: sessionDir)
+        let md = rec.deliveredFiles.flatMap { try? String(contentsOf: $0.markdown, encoding: .utf8) } ?? ""
+        let parsed = MarkdownDoc.parseDocument(md)
+        await check("长音频含 volatile 强退恢复同时保留草稿与缺口卡片",
+                    parsed.status == .partial
+                        && md.contains("接下来我们看传输层协议")
+                        && parsed.gapCount >= 1
+                        && md.contains("[00:00:02]–[00:00:12]"),
+                    "status=\(String(describing: parsed.status)) gaps=\(parsed.gapCount) md=\(md)")
     }
 }

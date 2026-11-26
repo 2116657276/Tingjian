@@ -206,7 +206,7 @@ struct SidebarPanel: View {
                 }
                 .buttonStyle(.borderless)
                 .disabled(rec.isActive)
-                .help("保存位置:\(model.saveRoot.path)")
+                .help("保存位置：\(model.saveRoot.path)")
                 .accessibilityLabel("更改保存位置")
             }
             .padding(.horizontal, 12)
@@ -228,6 +228,7 @@ struct RecordingDraftRow: View {
             Button { model.select(.draft(draft.id)) } label: {
                 HStack(spacing: 7) {
                     Image(systemName: model.activeDraftID == draft.id ? "waveform" : "record.circle")
+                        .foregroundStyle(model.activeDraftID == draft.id ? TingjianTheme.record : TingjianTheme.secondaryInk)
                         .frame(width: 14)
                         .accessibilityHidden(true)
                     Text(draft.title).lineLimit(1)

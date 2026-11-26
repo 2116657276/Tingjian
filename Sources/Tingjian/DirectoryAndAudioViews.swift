@@ -24,13 +24,22 @@ struct DirectoryDetail: View {
                             .foregroundStyle(TingjianTheme.secondaryInk)
                     }
                     Spacer()
-                    Button {
-                        model.newRecording(in: url)
-                    } label: {
-                        Label("在此录音", systemImage: "record.circle")
+                    if model.recordingBusy {
+                        Button {
+                            model.newRecording(in: url)
+                        } label: {
+                            Label("在此录音", systemImage: "record.circle")
+                        }
+                        .buttonStyle(.bordered)
+                    } else {
+                        Button {
+                            model.newRecording(in: url)
+                        } label: {
+                            Label("在此录音", systemImage: "record.circle")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(TingjianTheme.accent)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(TingjianTheme.accent)
 
                     Button("新建项目…") { model.newProjectRequest = true }
                         .buttonStyle(.bordered)
@@ -129,6 +138,10 @@ struct AudioDetail: View {
         model.isRetranscribing && model.retranscribingAudioURL == url.standardizedFileURL
     }
 
+    private var isLoadedInPlayer: Bool {
+        playback.isLoaded && playback.currentURL?.standardizedFileURL == url.standardizedFileURL
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             let audioParts = Paths.parseRecordingName(url.deletingPathExtension().lastPathComponent)
@@ -151,31 +164,24 @@ struct AudioDetail: View {
                     .foregroundStyle(TingjianTheme.warning)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if playback.currentURL?.standardizedFileURL == url.standardizedFileURL {
+            if isLoadedInPlayer {
                 Text("时长 \(Timecode.string(playback.duration)) · 使用下方控制带播放与拖动进度。")
                     .font(.system(size: 13))
                     .foregroundStyle(TingjianTheme.secondaryInk)
             }
-            HStack(spacing: 10) {
-                Button {
-                    model.retranscribeAudio(url)
-                } label: {
-                    Label(isRetranscribingThis ? "正在转写…" : "重新转写", systemImage: "waveform.badge.magnifyingglass")
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    primaryActionButtons
+                    secondaryActionButtons
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(TingjianTheme.accent)
-                .disabled(model.isRetranscribing || rec.isActive)
-                .help("从当前音频重新转写并另存为 _重转写.md，不覆盖原稿")
-
-                Button {
-                    NSWorkspace.shared.activateFileViewerSelecting([url])
-                } label: {
-                    Label("在 Finder 中显示", systemImage: "folder")
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        primaryActionButtons
+                    }
+                    HStack(spacing: 10) {
+                        secondaryActionButtons
+                    }
                 }
-                Button("重命名…") { model.requestRename(url) }
-                    .disabled(rec.isActive)
-                Button("移动到…") { model.requestMove(url) }
-                    .disabled(rec.isActive)
             }
             if isRetranscribingThis, let status = model.retranscribe {
                 HStack(spacing: 8) {
@@ -191,5 +197,51 @@ struct AudioDetail: View {
         .frame(maxWidth: .infinity, alignment: .center)
         .padding(.horizontal, 24)
         .padding(.top, 30)
+    }
+
+    @ViewBuilder
+    private var primaryActionButtons: some View {
+        if !isLoadedInPlayer {
+            Button {
+                Task { await model.playAudio(url) }
+            } label: {
+                Label("播放音频", systemImage: "play.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(TingjianTheme.accent)
+            .disabled(rec.isActive)
+            .help("加载并播放当前音频")
+        }
+        retranscribeButton(prominent: isLoadedInPlayer)
+    }
+
+    @ViewBuilder
+    private func retranscribeButton(prominent: Bool) -> some View {
+        let button = Button {
+            model.retranscribeAudio(url)
+        } label: {
+            Label(isRetranscribingThis ? "正在转写…" : "重新转写", systemImage: "waveform.badge.magnifyingglass")
+        }
+        .disabled(model.isRetranscribing || rec.isActive)
+        .help("从当前音频重新转写并另存为 _重转写.md，不覆盖原稿")
+
+        if prominent {
+            button.buttonStyle(.borderedProminent).tint(TingjianTheme.accent)
+        } else {
+            button.buttonStyle(.bordered)
+        }
+    }
+
+    @ViewBuilder
+    private var secondaryActionButtons: some View {
+        Button {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } label: {
+            Label("在 Finder 中显示", systemImage: "folder")
+        }
+        Button("重命名…") { model.requestRename(url) }
+            .disabled(rec.isActive)
+        Button("移动到…") { model.requestMove(url) }
+            .disabled(rec.isActive)
     }
 }

@@ -41,14 +41,20 @@ struct CurrentRecordingView: View {
                     Text("课程名称")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(TingjianTheme.secondaryInk)
-                    TextField("录音中可随时补填或修改课程名", text: Binding(
-                        get: { rec.courseName },
-                        set: { model.updateActiveRecordingCourseName($0) }
-                    ))
+                    TextField("录音中可随时补填或修改课程名", text: $model.activeCourseNameDraft)
                     .textFieldStyle(.roundedBorder)
                     .controlSize(.small)
                     .frame(maxWidth: 300)
                     .accessibilityLabel("当前录音课程名称")
+                    .onChange(of: model.activeCourseNameDraft) { _, _ in
+                        model.scheduleActiveCourseNameSync()
+                    }
+                    .onSubmit {
+                        model.flushActiveCourseName()
+                    }
+                    .onDisappear {
+                        model.flushActiveCourseName()
+                    }
                     Spacer(minLength: 8)
                 }
                 .padding(.horizontal, 24)
@@ -143,7 +149,9 @@ struct CurrentRecordingView: View {
                                 .buttonStyle(.link)
                                 .font(.system(size: 12))
                         }
-                        if !model.isRootDirectory(folder), !model.isDraftLocked(id) {
+                        if !model.isRootDirectory(folder),
+                           !(model.draft(id: id)?.placement != nil && model.isRootDirectory(folder.deletingLastPathComponent())),
+                           !model.isDraftLocked(id) {
                             Button("改存到根目录") { model.useRoot(for: id) }
                                 .buttonStyle(.link)
                                 .font(.system(size: 12))
@@ -270,12 +278,12 @@ struct CurrentRecordingView: View {
 
     private var emptyDetail: String {
         switch rec.phase {
-        case .starting: return "正在检查输入与本地保存目录,尚未开始采集音频。"
-        case .recording: return "说话后,确认文字会沉淀在这里;静音时没有文字属于正常现象。"
-        case .paused: return "暂停期间不会采集声音;继续后时间轴接着累计。"
-        case .finalizing: return "正在完成音频保存与转写收尾,不会显示没有依据的进度百分比。"
-        case .finished: return "音频仍然可以打开;静音或识别失败都可能没有文字。"
-        case .idle: return "点击开始后,转写正文会按时间持续出现在这里。"
+        case .starting: return "正在检查输入与本地保存目录，尚未开始采集音频。"
+        case .recording: return "说话后，确认文字会沉淀在这里；静音时没有文字属于正常现象。"
+        case .paused: return "暂停期间不会采集声音；继续后时间轴接着累计。"
+        case .finalizing: return "正在完成音频保存与转写收尾，不会显示没有依据的进度百分比。"
+        case .finished: return "音频仍然可以打开；静音或识别失败都可能没有文字。"
+        case .idle: return "点击开始后，转写正文会按时间持续出现在这里。"
         }
     }
 
@@ -317,11 +325,11 @@ struct SegmentRow: View {
     private var content: some View {
         if segment.incomplete {
             VStack(alignment: .leading, spacing: 6) {
-                Label("此段转写不完整(\(Timecode.string(segment.start))–\(Timecode.string(segment.end)))",
+                Label("此段转写不完整（\(Timecode.string(segment.start))–\(Timecode.string(segment.end))）",
                       systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(TingjianTheme.warning)
-                Text("音频仍已保存;这段时间没有可靠的识别文字。")
+                Text("音频仍已保存；这段时间没有可靠的识别文字。")
                     .font(.system(size: 12))
                     .foregroundStyle(TingjianTheme.secondaryInk)
             }
@@ -390,7 +398,7 @@ struct RecordingTime: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(label),时长 \(Timecode.string(duration))")
+        .accessibilityLabel("\(label)，时长 \(Timecode.string(duration))")
     }
 }
 

@@ -188,7 +188,7 @@ struct NewProjectSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("新建项目").font(.system(size: 15, weight: .semibold))
-            Text("位置:\(model.currentDirectory.path)")
+            Text("位置：\(model.currentDirectory.path)")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(TingjianTheme.secondaryInk)
                 .lineLimit(1)
@@ -196,7 +196,7 @@ struct NewProjectSheet: View {
             TextField("项目名称", text: $model.newProjectDraft)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(commit)
-            Text("项目直接对应磁盘上的文件夹;名称不能包含 / \\ : * ? \" < > | [ ]。")
+            Text("项目直接对应磁盘上的文件夹；名称不能包含 / \\ : * ? \" < > | [ ]。")
                 .font(.system(size: 11))
                 .foregroundStyle(TingjianTheme.secondaryInk)
                 .fixedSize(horizontal: false, vertical: true)

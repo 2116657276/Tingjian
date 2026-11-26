@@ -7,9 +7,15 @@ public enum ExportError: Error, LocalizedError {
     case copyVerify(String)
     public var errorDescription: String? {
         switch self {
-        case .durationMismatch(let a, let b): return "M4A 时长(\(Int(a))s)与已保存录音(\(Int(b))s)不符"
+        case .durationMismatch(let a, let b):
+            return "M4A 时长(\(Self.formatSeconds(a)))与已保存录音(\(Self.formatSeconds(b)))不符"
         case .copyVerify(let n): return "复制后校验失败:\(n)"
         }
+    }
+
+    private static func formatSeconds(_ value: Double) -> String {
+        guard value.isFinite, value >= 0, value < Double(Int.max) else { return "无效" }
+        return "\(Int(value))s"
     }
 }
 
@@ -17,11 +23,15 @@ public enum AudioExporter {
     /// CAF → AAC M4A(单声道约 64kbps),完成后读回时长校验。
     public static func exportM4A(from caf: URL, to m4a: URL) async throws -> Double {
         let input = try AVAudioFile(forReading: caf)
-        let expected = Double(input.length) / input.processingFormat.sampleRate
+        let sampleRate = input.processingFormat.sampleRate
+        guard sampleRate.isFinite, sampleRate > 0 else {
+            throw ExportError.durationMismatch(.nan, .nan)
+        }
+        let expected = Double(input.length) / sampleRate
         if FileManager.default.fileExists(atPath: m4a.path) { try FileManager.default.trashItem(at: m4a, resultingItemURL: nil) }
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: input.processingFormat.sampleRate,
+            AVSampleRateKey: sampleRate,
             AVNumberOfChannelsKey: 1,
             AVEncoderBitRateKey: 64_000,
         ]
@@ -40,7 +50,9 @@ public enum AudioExporter {
             output = nil // 释放以写入文件尾
         }
         let dur = try await AVURLAsset(url: m4a).load(.duration).seconds
-        if abs(dur - expected) > 1.0 { throw ExportError.durationMismatch(dur, expected) }
+        guard dur.isFinite, expected.isFinite, abs(dur - expected) <= 1.0 else {
+            throw ExportError.durationMismatch(dur, expected)
+        }
         return dur
     }
 }

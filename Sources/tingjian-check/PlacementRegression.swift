@@ -109,6 +109,57 @@ func recordingPlacementChecks() async {
         await check("占位目录冲突后保留录音并可重选保存位置",
                     wasPending && recorder.deliveredDir?.deletingLastPathComponent().standardizedFileURL == secondParent.standardizedFileURL
                     && (try? Data(contentsOf: blocker)) == Data("保留".utf8))
+
+        // Build 32 P1-1: .DS_Store 不阻断判空/移动/交付/断点续传；其他隐藏文件仍判占用
+        let dsPlacement = try await library.createRecordingPlacement(named: "含DSStore", in: firstParent)
+        try Data([0x00, 0x01]).write(to: dsPlacement.directory.appendingPathComponent(".DS_Store"))
+        let dsValid = (try? dsPlacement.validateEmpty()) != nil
+        let dsMoved = try await library.moveRecordingPlacement(dsPlacement, into: secondParent)
+        try Data([0x02, 0x03]).write(to: dsMoved.directory.appendingPathComponent(".DS_Store"))
+        let dsPubID = UUID()
+        let dsDelivered = try Deliverer.fill(dsMoved, audio: audio, markdown: md, id: dsPubID)
+        let dsAgain = try Deliverer.fill(dsMoved, audio: audio, markdown: md, id: dsPubID)
+        await check("占位目录含 .DS_Store 时判空/移动/交付与幂等重试均通过",
+                    dsValid && dsDelivered.directory == dsMoved.directory && dsAgain.directory == dsMoved.directory
+                    && (try? Data(contentsOf: dsDelivered.markdown)) == Data("# 合成转写".utf8))
+
+        let dsPartial = try await library.createRecordingPlacement(named: "含DSStore续传", in: root)
+        let dsPartialID = UUID()
+        let dsStage = root.appendingPathComponent(".tingjian-delivery-" + dsPartialID.uuidString, isDirectory: true)
+        try fm.createDirectory(at: dsStage, withIntermediateDirectories: false)
+        let dsMarker = try fm.contentsOfDirectory(atPath: dsPartial.directory.path)
+            .first { $0.hasPrefix(".tingjian-placement-") }!
+        try Data().write(to: dsStage.appendingPathComponent(dsMarker))
+        var dsIdentities: [String: [String: UInt64]] = [:]
+        for src in [audio, md] {
+            let staged = dsStage.appendingPathComponent(src.lastPathComponent)
+            try fm.copyItem(at: src, to: staged)
+            var info = stat()
+            guard lstat(staged.path, &info) == 0 else { throw CocoaError(.fileReadUnknown) }
+            dsIdentities[src.lastPathComponent] = [
+                "device": UInt64(bitPattern: Int64(info.st_dev)),
+                "inode": UInt64(info.st_ino)
+            ]
+        }
+        try JSONSerialization.data(withJSONObject: dsIdentities).write(to: dsStage.appendingPathComponent("manifest.json"))
+        try fm.moveItem(at: dsStage.appendingPathComponent(audio.lastPathComponent),
+                        to: dsPartial.directory.appendingPathComponent(audio.lastPathComponent))
+        try Data([0x04]).write(to: dsPartial.directory.appendingPathComponent(".DS_Store"))
+        let dsResumed = try Deliverer.fill(dsPartial, audio: audio, markdown: md, id: dsPartialID)
+        await check("占位目录断点续传存在 .DS_Store 时仍可补完交付",
+                    (try? Data(contentsOf: dsResumed.audio!)) == Data("合成音频".utf8)
+                    && (try? Data(contentsOf: dsResumed.markdown)) == Data("# 合成转写".utf8))
+
+        let hiddenOccupied = try await library.createRecordingPlacement(named: "含隐藏冲突", in: root)
+        try Data("hidden".utf8).write(to: hiddenOccupied.directory.appendingPathComponent(".foreign"))
+        var hiddenValidateRejected = false
+        do { try hiddenOccupied.validateEmpty() }
+        catch RecordingPlacementError.occupied { hiddenValidateRejected = true }
+        var hiddenFillRejected = false
+        do { _ = try Deliverer.fill(hiddenOccupied, audio: audio, markdown: md, id: UUID()) }
+        catch RecordingPlacementError.occupied { hiddenFillRejected = true }
+        await check("占位目录含非 .DS_Store 隐藏文件仍抛 .occupied",
+                    hiddenValidateRejected && hiddenFillRejected)
     } catch {
         await check("占位目录测试运行", false, error.localizedDescription)
     }

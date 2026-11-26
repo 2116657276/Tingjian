@@ -264,11 +264,13 @@ struct ContentView: View {
                     } else if let corrected = model.correctedDocumentURL(for: document) {
                         Button("打开校正版") { model.select(.document(corrected)) }
                     }
-                    Button(model.correctionWasAttempted(for: document) ? "再次纠正文本" : "纠正文本") {
-                        model.startCorrection(document: document)
+                    if model.openDocument?.lines.isEmpty == false && model.llmEnabled {
+                        Button(model.correctionWasAttempted(for: document) ? "再次纠正文本" : "纠正文本") {
+                            model.startCorrection(document: document)
+                        }
+                        .disabled(!model.llmConfigured || model.isCorrecting || rec.isActive)
+                        .help(model.correctionHelp)
                     }
-                    .disabled(!model.llmConfigured || model.isCorrecting || rec.isActive)
-                    .help(model.correctionHelp)
                     Divider()
                     Button("在默认应用中打开") { NSWorkspace.shared.open(document) }
                     LibraryEntryManageMenuItems(url: document, mutationDisabled: rec.isActive, separateLocationSection: false)
@@ -299,7 +301,9 @@ struct ContentView: View {
             Menu {
                 Button("选择保存位置…") { model.chooseDraftPlacement(id) }
                     .disabled(model.isDraftLocked(id))
-                if let folder = model.recordingDestination(for: id), !model.isRootDirectory(folder) {
+                if let folder = model.recordingDestination(for: id),
+                   !model.isRootDirectory(folder),
+                   !(model.draft(id: id)?.placement != nil && model.isRootDirectory(folder.deletingLastPathComponent())) {
                     Button("改存到根目录") { model.useRoot(for: id) }
                         .disabled(model.isDraftLocked(id))
                 }
@@ -462,9 +466,10 @@ struct ContentView: View {
                                    detail: message, path: rec.localDir?.path, tone: .warning, remedy: .none))
         }
         if let message = rec.message, !message.isEmpty {
-            items.append(IssueItem(id: rec.phase == .idle ? "start" : "message",
+            let issueID = rec.phase == .idle ? "start" : "message"
+            items.append(IssueItem(id: issueID,
                                    title: rec.phase == .idle ? "无法开始录音" : "麦克风或录音提示",
-                                   detail: message, path: rec.localDir?.path, tone: .error, remedy: .none))
+                                   detail: message, path: rec.localDir?.path, tone: .error, remedy: .dismiss(issueID)))
         }
         if let inputIssue = rec.inputIssue {
             items.append(IssueItem(id: "input", title: "录音输入异常",
@@ -472,7 +477,7 @@ struct ContentView: View {
         }
         if let error = model.inputSwitchError {
             items.append(IssueItem(id: "input-switch", title: "输入设备切换失败",
-                                   detail: error, path: nil, tone: .error, remedy: .none))
+                                   detail: error, path: nil, tone: .error, remedy: .dismiss("input-switch")))
         }
         switch rec.save {
         case .pending(let path, let reason):
@@ -494,7 +499,7 @@ struct ContentView: View {
         }
         if let notice = model.libraryNotice {
             items.append(IssueItem(id: "library", title: "资料库操作未完成",
-                                   detail: notice, path: nil, tone: .warning, remedy: .none))
+                                   detail: notice, path: nil, tone: .warning, remedy: .dismiss("library")))
         }
         if let error = model.audioError ?? model.playback.error {
             items.append(IssueItem(id: "playback", title: "音频无法播放",
@@ -507,7 +512,7 @@ struct ContentView: View {
         }
         if let message = model.seekMessage {
             items.append(IssueItem(id: "seek", title: "无法定位播放位置",
-                                   detail: message, path: nil, tone: .warning, remedy: .none))
+                                   detail: message, path: nil, tone: .warning, remedy: .dismiss("seek")))
         }
         return items
     }

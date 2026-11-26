@@ -56,7 +56,7 @@ struct SettingsView: View {
                         }
                     }
 
-                    SettingsSection(title: "保存与恢复", detail: "每次录音在目标文件夹新建独立文件夹;录制过程中先保存到本机恢复目录。") {
+                    SettingsSection(title: "保存与恢复", detail: "每次录音在目标文件夹新建独立文件夹；录制过程中先保存到本机恢复目录。") {
                         SettingsFieldRow(title: "目标文件夹", systemImage: "folder") {
                             HStack(spacing: 10) {
                                 Text(model.saveRoot.path)
@@ -70,7 +70,7 @@ struct SettingsView: View {
                                 Button("更改…") { model.chooseSaveRoot() }
                                     .controlSize(.small)
                                     .disabled(rec.isActive)
-                                    .accessibilityHint("选择录音与转写文件的目标文件夹;录音中不可更改")
+                                    .accessibilityHint("选择录音与转写文件的目标文件夹；录音中不可更改")
                             }
                         }
 
@@ -280,9 +280,9 @@ struct SettingsView: View {
             get: { model.audioInputUID },
             set: { model.audioInputUID = $0 }
         )) {
-            Text("系统默认(开始时固定)").tag(String?.none)
+            Text("系统默认（开始时固定）").tag(String?.none)
             ForEach(model.inputDevices) { device in
-                Text(device.name + (device.isDefault ? "(系统默认)" : "")).tag(Optional(device.id))
+                Text(device.name + (device.isDefault ? "（系统默认）" : "")).tag(Optional(device.id))
             }
             if model.savedInputUnavailable, let uid = model.audioInputUID {
                 Text("\(model.savedInputDisplayName)（当前未连接）").tag(Optional(uid))
@@ -447,7 +447,7 @@ private struct ModelMenu: View {
                     model.llmModel = candidate.id
                 } label: {
                     Text((model.llmModel == candidate.id ? "✓ " : "")
-                         + (candidate.supportsChat ? candidate.displayName : "\(candidate.displayName)(不支持纠正)"))
+                         + (candidate.supportsChat ? candidate.displayName : "\(candidate.displayName)（不支持纠正）"))
                 }
                 .disabled(!candidate.supportsChat)
                 .help(candidate.id)

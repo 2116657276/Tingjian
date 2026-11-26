@@ -179,7 +179,7 @@ extension AppModel {
     func activateTab(_ url: URL) {
         let key = url.standardizedFileURL
         guard FileManager.default.fileExists(atPath: key.path) else {
-            libraryNotice = "文件已移动或不存在:\(key.path)"
+            libraryNotice = "文件已移动或不存在：\(key.path)"
             return
         }
         if ProjectLibrary.isAudio(key) { select(.audio(key)) }
@@ -375,7 +375,7 @@ extension AppModel {
     func requestRename(_ url: URL) {
         guard !isRootDirectory(url) else { return }
         guard !recorder.isActive else {
-            libraryNotice = "录音进行中不能改名,请先结束录音。"
+            libraryNotice = "录音进行中不能改名，请先结束录音。"
             return
         }
         renameRequest = RenameRequest(url: url)
@@ -390,12 +390,12 @@ extension AppModel {
         let parent = currentDirectory.standardizedFileURL
         if !FileManager.default.fileExists(atPath: parent.path) {
             guard parent == saveRoot.standardizedFileURL else {
-                libraryNotice = "目标文件夹已不存在:\(parent.path)。请刷新后重试。"
+                libraryNotice = "目标文件夹已不存在：\(parent.path)。请刷新后重试。"
                 return
             }
             do { try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true) }
             catch {
-                libraryNotice = "无法创建资料库根目录:\(error.localizedDescription)"
+                libraryNotice = "无法创建资料库根目录：\(error.localizedDescription)"
                 return
             }
         }
@@ -560,7 +560,7 @@ extension AppModel {
         panel.prompt = "移动到这里"
         guard panel.runModal() == .OK, let destination = panel.url else { return nil }
         guard ProjectLibrary.contains(saveRoot, destination) else {
-            libraryNotice = "只能移动到当前资料库内:\(saveRoot.path)"
+            libraryNotice = "只能移动到当前资料库内：\(saveRoot.path)"
             return nil
         }
         return destination
@@ -578,6 +578,12 @@ extension AppModel {
         if case .pending = recorder.save { urls.append(recorder.sessionDestination) }
         if case .failed = recorder.save { urls.append(recorder.sessionDestination) }
         if let doc = correctionDocument { urls.append(doc) }
+        if let audio = retranscribingAudioURL { urls.append(audio) }
+        for dir in unfinished {
+            if let placementDir = SessionStore.readInfo(dir: dir)?.recordingPlacement?.directory {
+                urls.append(placementDir)
+            }
+        }
         await library.setProtected(urls)
     }
 

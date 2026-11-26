@@ -290,6 +290,7 @@ final class AppModel: ObservableObject {
         }
     }
     @Published var activeDraftID: UUID?
+    @Published var activeCourseNameDraft = ""
     @Published var recordingOperation = false
     @Published var placingDrafts: Set<UUID> = []
     @Published var interruptedDrafts: [UUID: URL] = [:]
@@ -345,7 +346,9 @@ final class AppModel: ObservableObject {
     private(set) var library: ProjectLibrary
 
     var correctionTask: Task<Void, Never>?
+    var courseNameSyncTask: Task<Void, Never>?
     var correctionDocument: URL?
+    weak var mainWindow: NSWindow?
     var correctionToken = UUID()
     var documentGeneration = 0
     var documentRead: Task<OpenDocument?, Error>?
@@ -469,6 +472,7 @@ final class AppModel: ObservableObject {
         guard canSelectQuickInput, !recorder.isActive else { return }
         nextInput = .configuredDefault
         inputSwitchError = nil
+        recorder.clearMessage()
     }
 
     func selectQuickInput(_ uid: String?) {
@@ -480,12 +484,32 @@ final class AppModel: ObservableObject {
                 return
             }
             Task {
-                do { try await recorder.switchInput(to: resolved) }
-                catch { inputSwitchError = "切换输入失败：\(error.localizedDescription)" }
+                do {
+                    try await recorder.switchInput(to: resolved)
+                    recorder.clearMessage()
+                } catch {
+                    inputSwitchError = "切换输入失败：\(error.localizedDescription)"
+                }
                 refreshInputDevices()
             }
         } else {
             nextInput = uid.map(NextInput.device) ?? .systemDefault
+            recorder.clearMessage()
+        }
+    }
+
+    func dismissIssue(id: String) {
+        switch id {
+        case "start", "message":
+            recorder.clearMessage()
+        case "input-switch":
+            inputSwitchError = nil
+        case "library":
+            libraryNotice = nil
+        case "seek":
+            seekMessage = nil
+        default:
+            break
         }
     }
 
@@ -548,8 +572,12 @@ final class AppModel: ObservableObject {
         recorder.$phase
             .sink { [weak self] phase in
                 guard let self else { return }
-                if phase != .recording && phase != .paused && self.stopConfirmationRequested {
-                    self.stopConfirmationRequested = false
+                if phase != .recording && phase != .paused {
+                    self.courseNameSyncTask?.cancel()
+                    self.courseNameSyncTask = nil
+                    if self.stopConfirmationRequested {
+                        self.stopConfirmationRequested = false
+                    }
                 }
             }
             .store(in: &bag)
@@ -572,10 +600,25 @@ final class AppModel: ObservableObject {
                   !self.needsInitialSetup,
                   self.renameRequest == nil,
                   !self.newProjectRequest,
-                  self.trashRequest == nil else {
+                  self.trashRequest == nil,
+                  !self.showIssues,
+                  !self.stopConfirmationRequested,
+                  NSApp.modalWindow == nil,
+                  let keyWindow = NSApp.keyWindow,
+                  keyWindow.attachedSheet == nil,
+                  !(keyWindow is NSPanel) else {
                 return event
             }
-            if let responder = NSApp.keyWindow?.firstResponder,
+            let isMainWindow: Bool = {
+                if let main = self.mainWindow {
+                    return keyWindow === main
+                }
+                return keyWindow.identifier?.rawValue == "main"
+            }()
+            guard isMainWindow else {
+                return event
+            }
+            if let responder = keyWindow.firstResponder,
                responder is NSText || responder is NSTextView || responder is NSTextField {
                 return event
             }

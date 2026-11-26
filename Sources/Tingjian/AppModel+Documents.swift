@@ -18,6 +18,29 @@ extension AppModel {
         playback.skip(by: delta)
     }
 
+    func closePlayback() {
+        if let current = playback.currentURL?.standardizedFileURL {
+            audioPositions[current] = playback.position
+        }
+        playback.stop()
+        activeDocumentBlockID = nil
+    }
+
+    func playAudio(_ url: URL) async {
+        guard !recorder.isActive else { return }
+        let key = url.standardizedFileURL
+        if playback.currentURL?.standardizedFileURL != key || !playback.isLoaded {
+            await loadAudio(url, at: audioPositions[key] ?? 0)
+        }
+        guard !recorder.isActive,
+              playback.currentURL?.standardizedFileURL == key,
+              playback.isLoaded,
+              playback.canSeek else { return }
+        if !playback.isPlaying {
+            playback.togglePlay()
+        }
+    }
+
     func updateActiveDocumentBlock(at position: Double) {
         guard let doc = openDocument,
               let linked = doc.linkedAudio?.standardizedFileURL,
@@ -39,7 +62,9 @@ extension AppModel {
     }
 
     var canSearchCurrentDocument: Bool {
-        if case .document = selection { return openDocument != nil }
+        if case .document = selection {
+            return openDocument?.blocks.isEmpty == false
+        }
         return false
     }
 
@@ -144,7 +169,11 @@ extension AppModel {
                 openDocument = loaded
                 documentsByURL[key] = loaded
             }
-            recomputeDocumentSearchMatches(resetIndex: true)
+            if doc.blocks.isEmpty && isDocumentSearchPresented {
+                dismissDocumentSearch()
+            } else {
+                recomputeDocumentSearchMatches(resetIndex: true)
+            }
             if let audio = doc.linkedAudio {
                 if playback.currentURL?.standardizedFileURL != audio.standardizedFileURL || force {
                     await loadAudio(audio, at: audioPositions[audio.standardizedFileURL] ?? 0, generation: generation)
@@ -170,7 +199,7 @@ extension AppModel {
         audioError = nil
         guard FileManager.default.fileExists(atPath: url.path) else {
             playback.stop()
-            audioError = "文件已移动或不存在:\(url.path)。请刷新项目列表。"
+            audioError = "文件已移动或不存在：\(url.path)。请刷新项目列表。"
             return
         }
         do {

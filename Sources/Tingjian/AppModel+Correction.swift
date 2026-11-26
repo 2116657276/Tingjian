@@ -142,7 +142,7 @@ extension AppModel {
     func cancelCorrection() {
         correctionTask?.cancel()
         if let url = correctionDocument {
-            correctionByDocument[url] = .failed("已取消,未生成校正版")
+            correctionByDocument[url] = .failed("已取消，未生成校正版")
         }
     }
 
@@ -160,9 +160,14 @@ extension AppModel {
             guard !segments.isEmpty else { throw CorrectionError.noSegments }
             var documentConfig = config
             let metadata = original.components(separatedBy: "\n").prefix(16)
-                .prefix(while: { !$0.hasPrefix("## 转写") }).joined(separator: "\n")
-            let projectFolder = url.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent
-            documentConfig.course = [projectFolder, url.deletingLastPathComponent().lastPathComponent,
+                .prefix(while: { !$0.hasPrefix("## ") }).joined(separator: "\n")
+            let parentDir = url.deletingLastPathComponent()
+            let recordingFolder = isRootDirectory(parentDir) ? "" : parentDir.lastPathComponent
+            let grandParentDir = parentDir.deletingLastPathComponent()
+            let projectFolder = (isRootDirectory(parentDir) || isRootDirectory(grandParentDir) || !ProjectLibrary.contains(saveRoot, grandParentDir))
+                ? ""
+                : grandParentDir.lastPathComponent
+            documentConfig.course = [projectFolder, recordingFolder,
                                      url.deletingPathExtension().lastPathComponent, metadata]
                 .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                 .joined(separator: "\n")
@@ -188,7 +193,7 @@ extension AppModel {
             // 写出前重读原稿:被外部修改则放弃,不基于旧版本生成校正版。
             let current = try String(contentsOf: url, encoding: .utf8)
             guard current == original else {
-                throw CorrectionError.mismatch("原稿已更改,请重新纠正")
+                throw CorrectionError.mismatch("原稿已更改，请重新纠正")
             }
             let base = url.deletingPathExtension().lastPathComponent
             let markdown = try TextCorrector.buildCorrectedMarkdown(
@@ -208,9 +213,9 @@ extension AppModel {
             await loadChildren(url.deletingLastPathComponent(), force: true)
             if selection == .document(url) { select(.document(output)) }
         } catch is CancellationError {
-            correctionByDocument[url] = .failed("已取消,未生成校正版")
+            correctionByDocument[url] = .failed("已取消，未生成校正版")
         } catch {
-            correctionByDocument[url] = .failed("\(error.localizedDescription)。未生成校正版,原始转写不受影响")
+            correctionByDocument[url] = .failed("\(error.localizedDescription)。未生成校正版，原始转写不受影响")
         }
     }
 
@@ -224,7 +229,7 @@ extension AppModel {
         }
         let p = NSOpenPanel()
         p.allowedContentTypes = [.audio]; p.canChooseDirectories = false
-        p.message = "选择要重新转写的录音(结果另存为 _重转写.md)"
+        p.message = "选择要重新转写的录音（结果另存为 _重转写.md）"
         p.directoryURL = saveRoot
         guard p.runModal() == .OK, let url = p.url else { return }
         retranscribeAudio(url)

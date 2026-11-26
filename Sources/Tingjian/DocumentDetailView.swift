@@ -371,14 +371,16 @@ struct DocumentDetail: View {
 
     @ViewBuilder
     private func secondaryActionButtons(_ doc: OpenDocument) -> some View {
-        Button {
-            model.presentDocumentSearch()
-        } label: {
-            Label("查找", systemImage: "magnifyingglass")
+        if !doc.blocks.isEmpty {
+            Button {
+                model.presentDocumentSearch()
+            } label: {
+                Label("查找", systemImage: "magnifyingglass")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("在当前文稿中查找（⌘F）")
         }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .help("在当前文稿中查找（⌘F）")
 
         Button {
             NSWorkspace.shared.open(doc.url)
@@ -387,7 +389,7 @@ struct DocumentDetail: View {
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
-        .help("使用系统默认应用（如 Obsidian）打开当前文稿")
+        .help("使用系统默认应用打开当前文稿（Obsidian 请从资料库打开）")
     }
 
     private func statusBadge(_ text: String, systemImage: String, tone: Color) -> some View {

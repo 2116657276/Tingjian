@@ -127,6 +127,10 @@ public final class Recorder: ObservableObject {
     /// 本次会话的目标目录:开始时固定,保存与重试都写这里。
     public var sessionDestination: URL { sessionSaveRoot ?? saveRoot }
 
+    public func clearMessage() {
+        message = nil
+    }
+
     // MARK: 开始 / 暂停 / 继续 / 结束
 
     @discardableResult
@@ -270,8 +274,7 @@ public final class Recorder: ObservableObject {
         phase = .paused
         level = 0
         clearSilenceWarning()
-        let current = source
-        await runInput { await current?.pause() }
+        await runInput { await self.source?.pause() }
     }
 
     /// 录音或暂停期间修改/补填课程名：只更新内存与交付用 baseName 并落盘 session.json，
@@ -354,7 +357,7 @@ public final class Recorder: ObservableObject {
                     await candidate.stop()
                     return
                 }
-                if wasRecording { try await candidate.start() }
+                if wasRecording && self.phase == .recording { try await candidate.start() }
                 if self.stopping {
                     failure = AudioError.captureFailed("录音已经结束")
                     await candidate.stop()
@@ -389,8 +392,10 @@ public final class Recorder: ObservableObject {
             self.activeInputName = candidate.activeDeviceName
             self.needsInputRebuild = false
             self.interruptionRetried = false
-            self.inputIssue = nil
-            if wasRecording {
+            if self.phase == .recording || !wasRecording {
+                self.inputIssue = nil
+            }
+            if wasRecording && self.phase == .recording {
                 let name = candidate.activeDeviceName ?? uid
                 self.addNote("麦克风由 \(previousName ?? "原设备") 切换为 \(name),切换期间未采集声音。")
             }
@@ -401,7 +406,7 @@ public final class Recorder: ObservableObject {
 
     /// 系统通知的设备断开:不结束录音,转暂停并保留补救入口。
     public func inputDeviceDisconnected(_ uid: String) async {
-        guard uid == activeInputUID, phase == .recording || phase == .paused, !stopping else { return }
+        guard uid == activeInputUID, phase == .recording || phase == .paused, !stopping, !isChangingInput else { return }
         let wasRecording = phase == .recording
         if wasRecording { await pause() }
         guard uid == activeInputUID, phase == .paused, !stopping else { return }
@@ -414,6 +419,7 @@ public final class Recorder: ObservableObject {
     public func stop() async {
         guard phase == .recording || phase == .paused, !stopping, let store, let pipeline else { return }
         stopping = true
+        defer { endActivity() }
         clearSilenceWarning()
         phase = .finalizing
         sourceGeneration += 1
@@ -421,7 +427,7 @@ public final class Recorder: ObservableObject {
         await pendingChain?.value
         let current = source
         await current?.stop()
-        stopTicking()
+        stopTicking(endActivity: false)
         let samples = await pipeline.close()
         if pipeline.failed, !notes.contains(where: { $0.contains("音频无法写入") }) {
             addNote("音频写入或重采样收尾失败，已保留可读取的录音。")
@@ -454,10 +460,16 @@ public final class Recorder: ObservableObject {
         if !engineOK && uncovered > 1 { record(assembler.markGap(start: assembler.lastEnd, end: duration)) }
         publishAssembler()
         let m4a = await m4aTask.value
+        let hasText = assembler.segments.contains {
+            !$0.incomplete && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
         let status: TranscriptStatus
-        if !assembler.events.contains(where: { $0.kind == .text }) && !engineOK { status = .failed }
-        else if !engineOK || pipeline.failed || assembler.segments.contains(where: \.incomplete) { status = .partial }
+        if !hasText && !engineOK { status = .failed }
+        else if !hasText || !engineOK || pipeline.failed || assembler.segments.contains(where: \.incomplete) { status = .partial }
         else { status = .completed }
+        if !hasText && engineOK && !notes.contains(where: { $0.contains("未识别出文字") }) {
+            notes.append("本次录音未识别出文字（可能为静音、设备无有效输入或音频过弱）。")
+        }
         transcribe = status == .completed ? .done : .incomplete
         await finishSession(store: store, m4a: m4a, duration: duration, status: status)
         stopping = false
@@ -475,12 +487,16 @@ public final class Recorder: ObservableObject {
         timer = t
     }
 
-    private func stopTicking() {
+    private func stopTicking(endActivity shouldEndActivity: Bool = true) {
         timer?.invalidate(); timer = nil
-        if let activity { ProcessInfo.processInfo.endActivity(activity) }
-        activity = nil
+        if shouldEndActivity { endActivity() }
         for o in sleepObservers { NSWorkspace.shared.notificationCenter.removeObserver(o) }
         sleepObservers = []
+    }
+
+    private func endActivity() {
+        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        activity = nil
     }
 
     private func tick() {

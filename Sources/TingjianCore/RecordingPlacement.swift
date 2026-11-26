@@ -59,10 +59,15 @@ public struct RecordingPlacement: Codable, Equatable, Sendable {
         return fd
     }
 
+    fileprivate static func effectiveEntries(in directory: URL) throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0 != ".DS_Store" }
+    }
+
     public func validateEmpty() throws {
         let fd = try openDirectory()
         defer { close(fd) }
-        guard try FileManager.default.contentsOfDirectory(atPath: directory.path) == [marker] else {
+        guard try Self.effectiveEntries(in: directory) == [marker] else {
             throw RecordingPlacementError.occupied
         }
     }
@@ -122,7 +127,7 @@ extension Deliverer {
         }
 
         guard Set(files.keys) == Set(sources.map(\.lastPathComponent)) else { throw RecordingPlacementError.changed }
-        let existing = try fm.contentsOfDirectory(atPath: folder.path)
+        let existing = try RecordingPlacement.effectiveEntries(in: folder)
         guard existing.allSatisfy({ $0 == placement.marker || files[$0] != nil }) else {
             throw RecordingPlacementError.occupied
         }
@@ -145,7 +150,7 @@ extension Deliverer {
         // Verify that the path still denotes the original directory before confirming delivery.
         let currentFD = try placement.openDirectory()
         close(currentFD)
-        guard Set(try fm.contentsOfDirectory(atPath: folder.path)) == Set(files.keys).union([placement.marker]) else {
+        guard Set(try RecordingPlacement.effectiveEntries(in: folder)) == Set(files.keys).union([placement.marker]) else {
             throw RecordingPlacementError.occupied
         }
         let receipt = openat(fd, marker, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o644)

@@ -111,9 +111,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DispatchQueue.main.async { [weak self] in
-            self?.mainWindow = NSApp.windows.first { window in
-                !(window is NSPanel) && window.canBecomeMain
-            }
+            let window = self?.findMainWindow()
+            self?.mainWindow = window
+            AppModel.shared.mainWindow = window
         }
     }
 
@@ -130,7 +130,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let rec = AppModel.shared.recorder
         if rec.phase == .starting { rec.cancelStarting(); return .terminateNow }
-        guard rec.isActive else { return .terminateNow }
+        guard rec.isActive else {
+            guard AppModel.shared.saveNeedsRetry else { return .terminateNow }
+            isPresentingTerminationAlert = true
+            defer { isPresentingTerminationAlert = false }
+
+            let alert = NSAlert()
+            alert.messageText = "上次录音尚未写入目标目录"
+            alert.informativeText = "音频与文字仍保存在本机恢复目录，退出后下次打开听笺可继续恢复并保存。"
+            alert.addButton(withTitle: "返回保存")
+            alert.addButton(withTitle: "仍然退出")
+            if alert.runModal() == .alertFirstButtonReturn {
+                restoreMainWindow()
+                return .terminateCancel
+            }
+            return .terminateNow
+        }
         if isSavingBeforeTermination {
             restoreMainWindow()
             return .terminateCancel
@@ -141,8 +156,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = rec.phase == .finalizing ? "正在保存录音" : "仍在录音"
         alert.informativeText = rec.phase == .finalizing
-            ? "录音正在保存,请等待完成后再退出。"
-            : "结束并保存会先保存音频和文字再退出;继续录音会关闭此提示。"
+            ? "录音正在保存，请等待完成后再退出。"
+            : "结束并保存会先保存音频和文字再退出；继续录音会关闭此提示。"
         if rec.phase == .finalizing {
             alert.addButton(withTitle: "好")
             alert.runModal()
@@ -157,6 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         isSavingBeforeTermination = true
         Task { @MainActor in
+            AppModel.shared.flushActiveCourseName()
             await rec.stop()
             isSavingBeforeTermination = false
             if case .saved = rec.save {
@@ -169,15 +185,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
+    private func findMainWindow() -> NSWindow? {
+        NSApp.windows.first { window in
+            !(window is NSPanel)
+                && window.canBecomeMain
+                && window.identifier?.rawValue == "main"
+        } ?? NSApp.windows.first { window in
+            !(window is NSPanel)
+                && window.canBecomeMain
+                && !(window.identifier?.rawValue.localizedCaseInsensitiveContains("settings") ?? false)
+        }
+    }
+
     /// 关闭最后一个窗口后取消退出时,SwiftUI 不会自动把主窗口带回前台。
     private func restoreMainWindow() {
         DispatchQueue.main.async { [weak self] in
             NSApp.activate(ignoringOtherApps: true)
-            let window = self?.mainWindow ?? NSApp.windows.first { window in
-                !(window is NSPanel) && window.canBecomeMain
-            }
+            let window = self?.mainWindow ?? self?.findMainWindow()
             window?.makeKeyAndOrderFront(nil)
             self?.mainWindow = window
+            AppModel.shared.mainWindow = window
         }
     }
 }

@@ -11,8 +11,8 @@ enum PlaybackError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noAudioTrack: return "这个文件没有可播放的音轨"
-        case .invalidDuration: return "音频时长无效,文件可能已损坏"
-        case .failed(let message): return "无法播放:\(message)"
+        case .invalidDuration: return "音频时长无效，文件可能已损坏"
+        case .failed(let message): return "无法播放：\(message)"
         }
     }
 }
