@@ -49,6 +49,12 @@ if CommandLine.arguments.contains("--correction-only") {
     finishAndExit(startedAt: runStartedAt)
 }
 
+if CommandLine.arguments.contains("--workspace-state-only") {
+    try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+    await workspaceStateRegressionChecks()
+    finishAndExit(startedAt: runStartedAt)
+}
+
 if CommandLine.arguments.contains("--weak-voice-bench") || CommandLine.arguments.contains("--weak-voice-holdout") {
     try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     await runWeakVoiceBenchmark(holdout: CommandLine.arguments.contains("--weak-voice-holdout"))

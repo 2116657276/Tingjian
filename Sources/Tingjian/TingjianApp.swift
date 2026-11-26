@@ -32,8 +32,10 @@ struct TingjianApp: App {
             CommandMenu("标签页") {
                 Button("上一个标签页") { AppModel.shared.activateRelativeTab(-1) }
                     .keyboardShortcut("[", modifiers: [.command, .option])
+                    .disabled(AppModel.shared.openTabs.isEmpty)
                 Button("下一个标签页") { AppModel.shared.activateRelativeTab(1) }
                     .keyboardShortcut("]", modifiers: [.command, .option])
+                    .disabled(AppModel.shared.openTabs.isEmpty)
                 Divider()
                 Button("关闭当前标签页") { AppModel.shared.closeActiveTab() }
                     .disabled(!AppModel.shared.canCloseActiveTab)

@@ -371,15 +371,18 @@ struct StatusBar: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(TingjianTheme.secondaryInk)
             } else if !issues.isEmpty {
+                let summary = issues.count == 1 ? issues[0].title : "\(issues.count) 个问题"
                 Button {
                     showIssues.toggle()
                 } label: {
-                    Label("\(issues.count) 个问题", systemImage: "exclamationmark.triangle.fill")
+                    Label(summary, systemImage: "exclamationmark.triangle.fill")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(TingjianTheme.warning)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("查看 \(issues.count) 个问题")
+                .accessibilityLabel("查看 \(summary)")
             } else {
                 Label("就绪", systemImage: "checkmark.circle")
                     .font(.system(size: 11))

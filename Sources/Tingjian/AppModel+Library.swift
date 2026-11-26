@@ -177,26 +177,18 @@ extension AppModel {
     }
 
     func activateTab(_ url: URL) {
-        let key = url.standardizedFileURL
-        guard FileManager.default.fileExists(atPath: key.path) else {
-            libraryNotice = "文件已移动或不存在：\(key.path)"
-            return
-        }
-        if ProjectLibrary.isAudio(key) { select(.audio(key)) }
-        else { select(.document(key)) }
+        let transition = WorkspaceTabPolicy.activate(url, in: openTabs, exists: Self.tabFileExists)
+        applyTabTransition(transition)
     }
 
     func closeTab(_ url: URL) {
-        let key = url.standardizedFileURL
-        let index = openTabs.firstIndex(of: key)
-        guard let index else { return }
-        openTabs.removeAll { $0 == key }
-        documentScrollAnchors[key] = nil
-        documentScrollPoints[key] = nil
-        documentsByURL[key] = nil
-        if selection.url?.standardizedFileURL == key {
-            selectTabAfterClosing(at: index)
-        }
+        let transition = WorkspaceTabPolicy.close(
+            url,
+            in: openTabs,
+            selectedURL: selection.url,
+            exists: Self.tabFileExists
+        )
+        applyTabTransition(transition)
     }
 
     func closeActiveTab() {
@@ -204,27 +196,18 @@ extension AppModel {
     }
 
     func closeOtherTabs(keeping url: URL) {
-        let key = url.standardizedFileURL
-        for tab in openTabs where tab != key {
-            documentScrollAnchors[tab] = nil
-            documentScrollPoints[tab] = nil
-            documentsByURL[tab] = nil
-        }
-        openTabs = openTabs.contains(key) ? [key] : []
-        activateTab(key)
+        let transition = WorkspaceTabPolicy.closeOthers(keeping: url, in: openTabs, exists: Self.tabFileExists)
+        applyTabTransition(transition)
     }
 
     func closeTabsToRight(of url: URL) {
-        let key = url.standardizedFileURL
-        guard let index = openTabs.firstIndex(of: key) else { return }
-        let removed = Array(openTabs.dropFirst(index + 1))
-        for tab in removed {
-            documentScrollAnchors[tab] = nil
-            documentScrollPoints[tab] = nil
-            documentsByURL[tab] = nil
-        }
-        openTabs = Array(openTabs.prefix(index + 1))
-        if let active = selection.url?.standardizedFileURL, removed.contains(active) { activateTab(key) }
+        let transition = WorkspaceTabPolicy.closeToRight(
+            of: url,
+            in: openTabs,
+            selectedURL: selection.url,
+            exists: Self.tabFileExists
+        )
+        applyTabTransition(transition)
     }
 
     var selectedFileTab: URL? {
@@ -234,17 +217,47 @@ extension AppModel {
 
     var canCloseActiveTab: Bool { selectedFileTab != nil }
 
-    private func selectTabAfterClosing(at index: Int) {
-        if openTabs.isEmpty { select(.directory(saveRoot)) }
-        else { activateTab(openTabs[min(index, openTabs.count - 1)]) }
+    func activateRelativeTab(_ offset: Int) {
+        let transition = WorkspaceTabPolicy.activateRelative(
+            offset,
+            in: openTabs,
+            selectedTab: selectedFileTab,
+            exists: Self.tabFileExists
+        )
+        applyTabTransition(transition)
     }
 
-    func activateRelativeTab(_ offset: Int) {
-        guard !openTabs.isEmpty else { return }
-        let index = selectedFileTab.flatMap { openTabs.firstIndex(of: $0) }
-        let next = index.map { ($0 + offset + openTabs.count) % openTabs.count }
-            ?? (offset < 0 ? openTabs.count - 1 : 0)
-        activateTab(openTabs[next])
+    private static func tabFileExists(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && !isDirectory.boolValue
+    }
+
+    private func applyTabTransition(_ transition: WorkspaceTabTransition) {
+        openTabs = transition.tabs
+        for tab in transition.removedTabs {
+            documentScrollAnchors[tab] = nil
+            documentScrollPoints[tab] = nil
+            documentsByURL[tab] = nil
+        }
+        switch transition.outcome {
+        case .unchanged:
+            break
+        case .activate(let url):
+            if ProjectLibrary.isAudio(url) { select(.audio(url)) }
+            else { select(.document(url)) }
+        case .fallbackToRoot:
+            select(.directory(saveRoot))
+        }
+        for dead in transition.removedDeadTabs {
+            audioPositions[dead] = nil
+        }
+        if let firstDead = transition.removedDeadTabs.first {
+            if transition.removedDeadTabs.count == 1 {
+                libraryNotice = "文件已移动或不存在，已自动移除失效标签：\(firstDead.path)"
+            } else {
+                libraryNotice = "已自动移除 \(transition.removedDeadTabs.count) 个失效标签（文件已移动或不存在：\(firstDead.path)）"
+            }
+        }
     }
 
     func scrollAnchor(for url: URL) -> Int? { documentScrollAnchors[url.standardizedFileURL] }

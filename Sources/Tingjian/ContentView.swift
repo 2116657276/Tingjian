@@ -92,7 +92,10 @@ struct ContentView: View {
 
     private var detailPane: some View {
         VStack(spacing: 0) {
-            header
+            contextHeader
+            if !model.openTabs.isEmpty {
+                tabBar
+            }
             if model.recordingBusy, !model.isRecordingSelection {
                 recordingBanner
             }
@@ -102,7 +105,6 @@ struct ContentView: View {
             if rec.phase == .recording, let silence = rec.silenceWarning {
                 silenceBanner(silence)
             }
-            Rectangle().fill(TingjianTheme.hairline).frame(height: 1)
             content
             Rectangle().fill(TingjianTheme.hairline).frame(height: 1)
             if rec.isActive || playback.isLoaded || hasSaveIssue { ControlBand() }
@@ -113,33 +115,33 @@ struct ContentView: View {
 
     private var isCurrentRecording: Bool { model.isRecordingSelection }
 
-    private var header: some View {
+    private var contextHeader: some View {
         HStack(spacing: 12) {
-            if !model.openTabs.isEmpty {
-                if model.selectedFileTab == nil {
-                    HStack(spacing: 6) {
-                        Image(systemName: contextIcon)
-                            .font(.system(size: 11))
-                            .foregroundStyle(isCurrentRecording ? TingjianTheme.record : TingjianTheme.accent)
-                        Text(contextTitle)
-                            .font(.system(size: 12, weight: .semibold))
+            HStack(spacing: 6) {
+                Image(systemName: contextIcon)
+                    .font(.system(size: 12))
+                    .foregroundStyle(isCurrentRecording ? TingjianTheme.record : TingjianTheme.accent)
+                    .fixedSize()
+                    .layoutPriority(2)
+                if let parentName = contextParentTitle {
+                    HStack(spacing: 4) {
+                        Text(parentName)
                             .lineLimit(1)
                             .truncationMode(.tail)
-                            .frame(maxWidth: 160, alignment: .leading)
+                        Text("/")
+                            .fixedSize()
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(TingjianTheme.controlSurface))
-                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(TingjianTheme.hairline, lineWidth: 1))
-                    .help(contextPath)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(TingjianTheme.tertiaryInk)
+                    .layoutPriority(0)
                 }
-                tabBar.frame(maxWidth: .infinity)
-            } else if isCurrentRecording || model.selection.draftID != nil {
-                Text(contextTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-            } else if case .directory = model.selection {
-                Text(contextTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                    .help(contextPath)
+                Text(contextTitle)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(1)
             }
+            .help(contextPath)
 
             Spacer(minLength: 12)
 
@@ -150,7 +152,20 @@ struct ContentView: View {
             selectedItemMenu
         }
         .padding(.horizontal, 14)
-        .frame(height: 40)
+        .frame(height: 38)
+        .background(TingjianTheme.paper)
+        .overlay(alignment: .bottom) { TingjianTheme.hairline.frame(height: 1) }
+    }
+
+    private var contextParentTitle: String? {
+        switch model.selection {
+        case .document(let url), .audio(let url):
+            let parent = url.deletingLastPathComponent()
+            guard !model.isRootDirectory(parent) else { return nil }
+            return Paths.parseRecordingName(parent.lastPathComponent)?.displayTitle ?? parent.lastPathComponent
+        case .currentRecording, .draft, .directory:
+            return nil
+        }
     }
 
     private var contextIcon: String {
@@ -163,73 +178,125 @@ struct ContentView: View {
     }
 
     private var tabBar: some View {
-        ScrollViewReader { proxy in
-            ScrollView(.horizontal) {
-                HStack(spacing: 2) {
-                    ForEach(model.openTabs, id: \.self) { tab in
-                        let active = model.selectedFileTab == tab
-                        HStack(spacing: 5) {
-                            Image(systemName: ProjectLibrary.isAudio(tab) ? "waveform" : "doc.text")
-                                .font(.system(size: 10))
-                                .foregroundStyle(active ? TingjianTheme.accent : TingjianTheme.tertiaryInk)
-                            Button { model.activateTab(tab) } label: {
-                                Text(tabTitle(for: tab))
-                                    .font(.system(size: 11, weight: active ? .medium : .regular))
-                                    .lineLimit(1)
-                                    .frame(maxWidth: 170, alignment: .leading)
+        HStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 2) {
+                        ForEach(model.openTabs, id: \.self) { tab in
+                            let active = model.selectedFileTab == tab
+                            let title = tabTitle(for: tab)
+                            HStack(spacing: 2) {
+                                Button { model.activateTab(tab) } label: {
+                                    HStack(spacing: 5) {
+                                        Image(systemName: ProjectLibrary.isAudio(tab) ? "waveform" : "doc.text")
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(active ? TingjianTheme.accent : TingjianTheme.tertiaryInk)
+                                        Text(title)
+                                            .font(.system(size: 11, weight: active ? .medium : .regular))
+                                            .lineLimit(1)
+                                            .truncationMode(.tail)
+                                            .frame(maxWidth: 170, alignment: .leading)
+                                    }
+                                    .padding(.leading, 8)
+                                    .padding(.trailing, 2)
+                                    .frame(maxHeight: .infinity)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help(tab.path)
+
+                                Button { model.closeTab(tab) } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: 8, weight: .semibold))
+                                        .foregroundStyle(active ? TingjianTheme.secondaryInk : TingjianTheme.tertiaryInk)
+                                        .frame(width: 16, height: 16)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.borderless)
+                                .padding(.trailing, 4)
+                                .accessibilityLabel("关闭 \(title)")
                             }
-                            .buttonStyle(.plain)
-                            .help(tab.path)
-                            Button { model.closeTab(tab) } label: {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 8, weight: .semibold))
-                                    .frame(width: 16, height: 16)
+                            .frame(height: 26)
+                            .background(RoundedRectangle(cornerRadius: 5).fill(active ? TingjianTheme.controlSurface : .clear))
+                            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(active ? TingjianTheme.hairline : .clear, lineWidth: 1))
+                            .id(tab)
+                            .contextMenu {
+                                Button("关闭标签页") { model.closeTab(tab) }
+                                Button("关闭其他文件标签") { model.closeOtherTabs(keeping: tab) }
+                                Button("关闭右侧文件标签") { model.closeTabsToRight(of: tab) }
+                                    .disabled(model.openTabs.last == tab)
                             }
-                            .buttonStyle(.borderless)
-                            .accessibilityLabel("关闭 \(tabTitle(for: tab))")
-                        }
-                        .padding(.leading, 8)
-                        .padding(.trailing, 4)
-                        .frame(height: 28)
-                        .background(RoundedRectangle(cornerRadius: 5).fill(active ? TingjianTheme.controlSurface : .clear))
-                        .contentShape(Rectangle())
-                        .id(tab)
-                        .contextMenu {
-                            Button("关闭标签页") { model.closeTab(tab) }
-                            Button("关闭其他文件标签") { model.closeOtherTabs(keeping: tab) }
-                            Button("关闭右侧文件标签") { model.closeTabsToRight(of: tab) }
-                                .disabled(model.openTabs.last == tab)
                         }
                     }
+                    .scrollTargetLayout()
+                    .padding(.horizontal, 10)
                 }
-                .padding(.horizontal, 10)
+                .scrollIndicators(.never)
+                .scrollTargetBehavior(.viewAligned)
+                .mask {
+                    if model.openTabs.count > 1 {
+                        HStack(spacing: 0) {
+                            LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
+                                .frame(width: 10)
+                            Color.black
+                            LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
+                                .frame(width: 10)
+                        }
+                    } else {
+                        Color.black
+                    }
+                }
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { _, _ in
+                    if let tab = model.selectedFileTab { proxy.scrollTo(tab, anchor: .center) }
+                }
+                .onChange(of: model.selectedFileTab) { _, tab in
+                    guard let tab else { return }
+                    if reduceMotion {
+                        proxy.scrollTo(tab, anchor: .center)
+                    } else {
+                        withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(tab, anchor: .center) }
+                    }
+                }
+                .onAppear {
+                    if let tab = model.selectedFileTab { proxy.scrollTo(tab, anchor: .center) }
+                }
             }
-            .scrollIndicators(.hidden)
-            .onChange(of: model.selectedFileTab) { _, tab in
-                guard let tab else { return }
-                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(tab, anchor: .center) }
-            }
-            .onAppear {
-                if let tab = model.selectedFileTab { proxy.scrollTo(tab, anchor: .center) }
+
+            if model.openTabs.count > 1 {
+                TingjianTheme.hairline.frame(width: 1, height: 16)
+                Menu {
+                    ForEach(model.openTabs, id: \.self) { tab in
+                        let active = model.selectedFileTab == tab
+                        let title = tabTitle(for: tab)
+                        Button { model.activateTab(tab) } label: {
+                            if active {
+                                Label(title, systemImage: "checkmark")
+                            } else {
+                                Text(title)
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(TingjianTheme.secondaryInk)
+                        .frame(width: 28, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .accessibilityLabel("全部已打开标签页")
+                .help("查看全部已打开标签页（\(model.openTabs.count)）")
             }
         }
-        .frame(height: 34)
+        .frame(height: 32)
         .background(TingjianTheme.windowSurface)
         .overlay(alignment: .bottom) { TingjianTheme.hairline.frame(height: 1) }
     }
 
     private func tabTitle(for tab: URL) -> String {
-        let base = tab.deletingPathExtension().lastPathComponent
-        let parts = Paths.parseRecordingName(base)
-        let title = parts?.displayTitle ?? base
-        let duplicates = model.openTabs.filter { candidate in
-            let name = candidate.deletingPathExtension().lastPathComponent
-            return (Paths.parseRecordingName(name)?.displayTitle ?? name) == title
-        }
-        guard duplicates.count > 1 else { return title }
-        let sameParent = duplicates.filter { $0.deletingLastPathComponent() == tab.deletingLastPathComponent() }
-        if sameParent.count > 1 { return title + "." + tab.pathExtension }
-        return "\(title) · \(parts?.compactDate ?? tab.deletingLastPathComponent().lastPathComponent)"
+        WorkspaceTabPolicy.title(for: tab, in: model.openTabs)
     }
 
     private var hasSaveIssue: Bool {
@@ -356,6 +423,7 @@ struct ContentView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
         .background(TingjianTheme.record.opacity(0.07))
+        .overlay(alignment: .bottom) { TingjianTheme.hairline.frame(height: 1) }
     }
 
     private var recordingBannerText: String {
@@ -399,6 +467,7 @@ struct ContentView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 7)
         .background(issue.tone.color.opacity(0.06))
+        .overlay(alignment: .bottom) { TingjianTheme.hairline.frame(height: 1) }
     }
 
     private func silenceBanner(_ message: String) -> some View {
@@ -418,6 +487,7 @@ struct ContentView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
         .background(TingjianTheme.warning.opacity(0.06))
+        .overlay(alignment: .bottom) { TingjianTheme.hairline.frame(height: 1) }
     }
 
     @ViewBuilder
@@ -498,7 +568,15 @@ struct ContentView: View {
                                    tone: .warning, remedy: .retryCorrection(url)))
         }
         if let notice = model.libraryNotice {
-            items.append(IssueItem(id: "library", title: "资料库操作未完成",
+            let title: String
+            if notice.hasPrefix("已自动移除") {
+                title = notice.components(separatedBy: "（").first ?? "已自动移除失效标签"
+            } else if notice.hasPrefix("文件已移动或不存在") {
+                title = "文件已移动或不存在"
+            } else {
+                title = "资料库操作未完成"
+            }
+            items.append(IssueItem(id: "library", title: title,
                                    detail: notice, path: nil, tone: .warning, remedy: .dismiss("library")))
         }
         if let error = model.audioError ?? model.playback.error {
